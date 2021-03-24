@@ -8,13 +8,14 @@ edition = "2018"
 
 [dependencies]
 drop = { git = "https://github.com/Distributed-EPFL/drop", branch = "feature/refactor", features = [ "system" ] }
-sieve = { git = "https://github.com/Distributed-EPFL/sieve" }
+sieve = { git = "https://github.com/Distributed-EPFL/sieve", branch = "batched" }
 snafu = "0.6"
-tokio = { version = "0.2", features = [ "sync" ] }
+tokio = { version = "1", features = [ "sync" ] }
 futures = "0.3"
 serde = "1.0"
 tracing = "0.1"
 
 [dev-dependencies]
 drop = { git = "https://github.com/Distributed-EPFL/drop", branch = "feature/refactor", features = [ "test" ] }
-sieve = { git = "https://github.com/Distributed-EPFL/sieve" , features = [ "test" ] }
+sieve = { git = "https://github.com/Distributed-EPFL/sieve", branch = "batched", features = [ "test" ] }
+tokio = { version = "1", features = [ "macros" ] } 

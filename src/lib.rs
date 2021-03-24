@@ -22,7 +22,7 @@ use futures::future;
 
 use serde::{Deserialize, Serialize};
 
-use sieve::{Sieve, SieveHandle, SieveMessage};
+use sieve::classic::{Sieve, SieveError, SieveHandle, SieveMessage, SieveProcessingError};
 
 use snafu::{OptionExt, ResultExt, Snafu};
 
@@ -67,7 +67,7 @@ pub enum ContagionProcessingError<M: Message + 'static> {
     /// Sieve error encountered
     SieveProcess {
         /// Sieve error content
-        source: sieve::SieveProcessingError<(M, Signature)>,
+        source: SieveProcessingError<(M, Signature)>,
     },
 }
 
@@ -80,7 +80,7 @@ pub enum ContagionError {
     /// Error encountered when using the sieve primitive to initially broadcast
     Broadcast {
         /// The underlying `SieveError`
-        source: sieve::SieveError,
+        source: SieveError,
     },
     #[snafu(display("handle already used to broadcast"))]
     /// Error encountered when a `ContagionHandle` has already been used to
@@ -321,7 +321,7 @@ impl<M: Message + 'static> Contagion<M> {
 }
 
 #[async_trait]
-impl<M, S> Processor<ContagionMessage<(M, Signature)>, M, S> for Contagion<M>
+impl<M, S> Processor<ContagionMessage<(M, Signature)>, M, M, S> for Contagion<M>
 where
     S: Sender<ContagionMessage<(M, Signature)>> + 'static,
     M: Message + 'static,
@@ -375,7 +375,7 @@ where
 
                 match self.handle.lock().await.take() {
                     Some(mut handle) => {
-                        if let Ok(Some((message, signature))) = handle.try_deliver() {
+                        if let Ok(Some((message, signature))) = handle.try_deliver().await {
                             let mut signer = Signer::new(self.keypair.deref().clone());
 
                             if signer.verify(&signature, &self.sender, &message).is_ok()
@@ -467,7 +467,7 @@ impl<M: Message> ContagionHandle<M> {
 }
 
 #[async_trait]
-impl<M: Message> Handle<M> for ContagionHandle<M> {
+impl<M: Message> Handle<M, M> for ContagionHandle<M> {
     type Error = ContagionError;
 
     async fn deliver(&mut self) -> Result<M, Self::Error> {
@@ -479,7 +479,7 @@ impl<M: Message> Handle<M> for ContagionHandle<M> {
             .context(NoMessage)
     }
 
-    fn try_deliver(&mut self) -> Result<Option<M>, Self::Error> {
+    async fn try_deliver(&mut self) -> Result<Option<M>, Self::Error> {
         let mut deliver = self.incoming.take().context(AlreadyUsed)?;
 
         match deliver.try_recv() {
@@ -515,7 +515,7 @@ impl<M: Message> Handle<M> for ContagionHandle<M> {
 mod test {
     use super::*;
 
-    use sieve::test::sieve_message_sequence;
+    use sieve::classic::test::sieve_message_sequence;
 
     use drop::crypto::key::exchange;
     use drop::test::*;
@@ -595,7 +595,7 @@ mod test {
         init_logger();
         let keypair = KeyPair::random();
         let sender = keypair.public();
-        let (manager, signature) = create_contagion_manager(&keypair, 0usize, SIZE);
+        let (mut manager, signature) = create_contagion_manager(&keypair, 0usize, SIZE);
         let processor = Contagion::new_receiver(
             *keypair.public(),
             Arc::new(KeyPair::random()),
