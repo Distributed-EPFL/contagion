@@ -24,9 +24,14 @@ use tokio::sync::{oneshot, Mutex, RwLock};
 use tracing::{debug, error};
 
 #[message]
-pub(crate) enum ContagionMessage<M: Message> {
+/// Wire messages exchanged by [`Contagion`]
+///
+/// [`Contagion`]: self::Contagion
+pub enum ContagionMessage<M: Message> {
     #[serde(bound = "M: Message")]
     /// A message intended for the underlying `Sieve` instance
+    ///
+    /// [`Sieve`]: sieve::classic::Sieve
     Sieve(SieveMessage<M>),
     #[serde(bound = "M: Message")]
     /// Ready echo message
@@ -42,7 +47,9 @@ impl<M: Message> From<SieveMessage<(M, Signature)>> for ContagionMessage<(M, Sig
 }
 
 #[derive(Debug, Snafu)]
-/// Error type returned by `Contagion::process`
+/// Error type returned by [`Contagion::process`]
+///
+/// [`Contagion::process`]: self::Contagion::process
 pub enum ContagionProcessingError<M: Message + 'static> {
     #[snafu(display("bad signature from {}", from))]
     /// Signature is invalid for the message processed
@@ -67,7 +74,9 @@ pub enum ContagionProcessingError<M: Message + 'static> {
 type MaybeHandle<M> = Arc<Mutex<Option<SieveHandle<(M, Signature)>>>>;
 
 #[derive(Debug, Snafu)]
-/// Errors encountered by the `Contagion` broadcast primitive
+/// Errors encountered by the [`Contagion`] broadcast primitive
+///
+/// [`Contagion`]: self::Contagion
 pub enum ContagionError {
     #[snafu(display("failed to broadcast message: {}", source))]
     /// Error encountered when using the sieve primitive to initially broadcast
@@ -119,8 +128,10 @@ pub struct Contagion<M: Message + 'static> {
 }
 
 impl<M: Message + 'static> Contagion<M> {
-    /// Create a new `Contagion` that can only be used for delivering one
+    /// Create a new [`Contagion`] that can only be used for delivering one
     /// message from a designated sender
+    ///
+    /// [`Contagion`]: self::Contagion
     pub fn new_receiver(
         sender: sign::PublicKey,
         keypair: Arc<sign::KeyPair>,
@@ -134,8 +145,10 @@ impl<M: Message + 'static> Contagion<M> {
         Self::common_setup(sender, keypair, sieve, delivery_threshold, ready_threshold)
     }
 
-    /// Create a `Contagion` instance that can only be used to receive one
+    /// Create a [`Contagion`] instance that can only be used to receive one
     /// message
+    ///
+    /// [`Contagion`]: self::Contagion
     pub fn new_sender(
         sender: sign::PublicKey,
         keypair: Arc<KeyPair>,
@@ -438,8 +451,11 @@ where
     }
 }
 
-/// A `Handle` for interacting with `Contagion` once scheduled to run
+/// A [`Handle`] for interacting with [`Contagion`] once scheduled to run
 /// on a manager.
+///
+/// [`Handle`]: drop::system::manager::Handle
+/// [`Contagion`]: self::Contagion
 pub struct ContagionHandle<M: Message> {
     signer: Signer,
     incoming: Option<oneshot::Receiver<M>>,
