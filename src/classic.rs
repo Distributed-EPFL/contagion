@@ -109,7 +109,7 @@ pub struct Contagion<M: Message + 'static> {
     delivery_threshold: usize,
     ready_threshold: usize,
 
-    sieve: Arc<Sieve<(M, Signature)>>,
+    sieve: Sieve<(M, Signature)>,
 
     handle: MaybeHandle<M>,
     delivered: Mutex<Option<(M, Signature)>>,
@@ -173,7 +173,7 @@ impl<M: Message + 'static> Contagion<M> {
         Self {
             sender,
             keypair,
-            sieve: Arc::new(sieve),
+            sieve,
             deliverer: Mutex::new(None),
 
             ready_threshold,
@@ -337,7 +337,7 @@ where
     type Error = ContagionProcessingError<M>;
 
     async fn process(
-        self: Arc<Self>,
+        &self,
         message: Arc<ContagionMessage<(M, Signature)>>,
         from: PublicKey,
         sender: Arc<S>,
@@ -374,7 +374,6 @@ where
             ContagionMessage::Sieve(msg) => {
                 let sieve_sender = Arc::new(ConvertSender::new(sender.clone()));
                 self.sieve
-                    .clone()
                     .process(Arc::new(msg.clone()), from, sieve_sender)
                     .await
                     .context(SieveProcess)?;
@@ -413,8 +412,8 @@ where
 
     async fn output<SA: Sampler>(&mut self, sampler: Arc<SA>, sender: Arc<S>) -> Self::Handle {
         let sieve_sender = ConvertSender::new(sender.clone());
-        let handle = Arc::get_mut(&mut self.sieve)
-            .expect("double setup detected")
+        let handle = self
+            .sieve
             .output(sampler.clone(), Arc::new(sieve_sender))
             .await;
 

@@ -91,7 +91,7 @@ where
     R: RdvPolicy,
 {
     config: BatchedContagionConfig,
-    sieve: Arc<BatchedSieve<M, SieveSender<S, M>, R>>,
+    sieve: BatchedSieve<M, SieveSender<S, M>, R>,
     gossip: RwLock<HashSet<PublicKey>>,
     handle: Option<Arc<Mutex<BatchedSieveHandle<M>>>>,
     delivery: Option<mpsc::Sender<FilteredBatch<M>>>,
@@ -108,7 +108,7 @@ where
 {
     /// Create new `BatchedContagion` from the given configuration
     pub fn new(keypair: KeyPair, config: BatchedContagionConfig, rdv: R) -> Self {
-        let sieve = Arc::new(BatchedSieve::new(keypair, rdv, config.sieve));
+        let sieve = BatchedSieve::new(keypair, rdv, config.sieve);
         Self {
             config,
             sieve,
@@ -162,7 +162,7 @@ where
     type Error = BatchedContagionError;
 
     async fn process(
-        self: Arc<Self>,
+        &self,
         message: Arc<BatchedContagionMessage<M>>,
         from: PublicKey,
         sender: Arc<S>,
@@ -176,7 +176,6 @@ where
             BatchedContagionMessage::Sieve(sieve) => {
                 let sender = Arc::new(ConvertSender::new(sender));
                 self.sieve
-                    .clone()
                     .process(Arc::new(sieve.clone()), from, sender)
                     .await
                     .context(SieveError)?;
@@ -200,10 +199,7 @@ where
         SA: Sampler,
     {
         let sieve_sender = Arc::new(ConvertSender::new(sender.clone()));
-        let handle = Arc::get_mut(&mut self.sieve)
-            .unwrap()
-            .output(sampler.clone(), sieve_sender)
-            .await;
+        let handle = self.sieve.output(sampler.clone(), sieve_sender).await;
 
         let handle = Arc::new(Mutex::new(handle));
 
