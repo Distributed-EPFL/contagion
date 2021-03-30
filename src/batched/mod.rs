@@ -1,14 +1,14 @@
 //! <p>This module provides  the batched version of [`Contagion`].</p>
 //!
 //! <p>[`BatchedContagion`] provides the same safety guarantees as regular [`Contagion`] but also
-//! makes effort to reduce unnecessary network IO and latency but batching blocks of transaction
+//! makes effort to reduce unnecessary network IO and latency by batching blocks of transaction
 //! together.</p>
 //!
 //! [`Contagion`]: crate::classic::Contagion
 //! [`BatchedContagion`]: crate::batched::BatchedContagion
 //! [`RdvPolicy`]: crate::batched::RdvPolicy
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use drop::async_trait;
@@ -19,6 +19,8 @@ use drop::system::manager::Handle;
 use drop::system::sender::{ConvertSender, SenderError};
 use drop::system::{message, Message, Processor, Sampler, Sender};
 
+use futures::stream::StreamExt;
+
 use sieve::batched::{
     BatchedSieve, BatchedSieveError, BatchedSieveHandle, BatchedSieveMessage, EchoHandle,
 };
@@ -26,12 +28,17 @@ pub use sieve::batched::{FilteredBatch, RdvPolicy, Sequence};
 
 use serde::{Deserialize, Serialize};
 
-use snafu::{ResultExt, Snafu};
+use snafu::{OptionExt, ResultExt, Snafu};
 
 use tokio::sync::{mpsc, Mutex, RwLock};
 
+use tracing::debug;
+
 mod config;
 pub use config::{BatchedContagionConfig, BatchedContagionConfigBuilder};
+
+mod pending;
+pub use pending::PendingSequences;
 
 #[derive(Debug, Snafu)]
 /// Errors encountered by the `BatchedContagion` algorithm
@@ -55,6 +62,12 @@ pub enum BatchedContagionError {
     #[snafu(display("channel is closed, delivery impossible"))]
     /// A channel was closed when attempting to send or receive a message
     Channel,
+
+    /// The `BatchedContagion` instance was not setup before running.
+    /// This may happen when `BatchedContagion::output` isn't called before starting
+    /// the `Processor`
+    #[snafu(display("contagion was not setup properly"))]
+    NotSetup,
 }
 
 #[message]
@@ -92,12 +105,15 @@ where
 {
     config: BatchedContagionConfig,
     sieve: BatchedSieve<M, SieveSender<S, M>, R>,
-    gossip: RwLock<HashSet<PublicKey>>,
+    subscribers: RwLock<HashSet<PublicKey>>,
     handle: Option<Arc<Mutex<BatchedSieveHandle<M>>>>,
     delivery: Option<mpsc::Sender<FilteredBatch<M>>>,
 
+    batches: RwLock<HashMap<Digest, Arc<PendingSequences>>>,
+
+    ready_set: RwLock<HashSet<PublicKey>>,
+
     ready_agent: EchoHandle,
-    deliver_agent: EchoHandle,
 }
 
 impl<M, S, R> BatchedContagion<M, S, R>
@@ -109,15 +125,19 @@ where
     /// Create new `BatchedContagion` from the given configuration
     pub fn new(keypair: KeyPair, config: BatchedContagionConfig, rdv: R) -> Self {
         let sieve = BatchedSieve::new(keypair, rdv, config.sieve);
+
         Self {
             config,
             sieve,
-            gossip: Default::default(),
+            subscribers: Default::default(),
             handle: Default::default(),
             delivery: Default::default(),
 
+            ready_set: Default::default(),
+
             ready_agent: Default::default(),
-            deliver_agent: Default::default(),
+
+            batches: Default::default(),
         }
     }
 
@@ -135,17 +155,28 @@ where
     async fn deliverable(
         &self,
         digest: Digest,
-        seqs: impl Iterator<Item = &Sequence>,
+        from: PublicKey,
+        seqs: impl Iterator<Item = Sequence>,
     ) -> Option<FilteredBatch<M>> {
-        todo!(
-            "register echoes for {}: {}",
-            digest,
-            seqs.fold("".to_string(), |mut acc, curr| {
-                acc.push_str(format!("{}", curr).as_str());
-                acc.push(',');
-                acc
+        let correct = self
+            .ready_agent
+            .send_many(digest, from, seqs)
+            .await
+            .filter_map(|(seq, count)| async move {
+                if self.config.ready_threshold_cmp(count) {
+                    Some(seq)
+                } else {
+                    None
+                }
             })
-        )
+            .collect::<BTreeSet<_>>()
+            .await;
+
+        let status = self.batches.read().await.get(&digest).map(Clone::clone)?;
+
+        let delivery = status.register_delivered(correct.iter()).await;
+
+        todo!()
     }
 }
 
@@ -168,27 +199,63 @@ where
         sender: Arc<S>,
     ) -> Result<(), Self::Error> {
         match &*message {
-            BatchedContagionMessage::Ready(digest, except) => {
-                if let Some(delivery) = self.deliverable(*digest, except.iter()).await {
-                    todo!("deliver {}", delivery)
+            BatchedContagionMessage::Ready(digest, including)
+                if self.ready_set.read().await.contains(&from) =>
+            {
+                if let Some(batch) = self
+                    .deliverable(*digest, from, including.iter().copied())
+                    .await
+                {
+                    self.delivery
+                        .as_ref()
+                        .context(NotSetup)?
+                        .send(batch)
+                        .await
+                        .map_err(|_| snafu::NoneError)
+                        .context(Channel)?;
                 }
             }
+
             BatchedContagionMessage::Sieve(sieve) => {
-                let sender = Arc::new(ConvertSender::new(sender));
+                let sieve_sender = Arc::new(ConvertSender::new(sender.clone()));
                 self.sieve
-                    .process(Arc::new(sieve.clone()), from, sender)
+                    .process(Arc::new(sieve.clone()), from, sieve_sender)
                     .await
                     .context(SieveError)?;
 
                 if let Some(delivered) = self.try_deliver().await {
-                    todo!("start processing second echo round for {}", delivered);
+                    let digest = *delivered.digest();
+
+                    let new_seqs = {
+                        let mut guard = self.batches.write().await;
+                        let batch = guard.entry(*delivered.digest()).or_default();
+
+                        batch.register_pending(delivered.included()).await
+                    };
+
+                    if !new_seqs.is_empty() {
+                        debug!("announcing new batch {} to subscribers", digest);
+
+                        sender
+                            .send_many(
+                                Arc::new(BatchedContagionMessage::Ready(digest, new_seqs)),
+                                self.subscribers.read().await.iter(),
+                            )
+                            .await
+                            .context(Network {
+                                when: "sending echoes",
+                            })?;
+                    }
                 }
             }
+
             BatchedContagionMessage::Subscribe => {
-                if self.gossip.write().await.insert(from) {
+                if self.subscribers.write().await.insert(from) {
                     todo!("broadcast everything state info required");
                 }
             }
+
+            e => debug!("ignored {:?} from {}", e, from),
         }
 
         Ok(())
@@ -202,6 +269,19 @@ where
         let handle = self.sieve.output(sampler.clone(), sieve_sender).await;
 
         let handle = Arc::new(Mutex::new(handle));
+        let keys = sender.keys().await;
+
+        let sample = sampler
+            .sample(keys.iter().copied(), self.config.ready_threshold)
+            .await
+            .expect("sampling failed");
+
+        sender
+            .send_many(Arc::new(BatchedContagionMessage::Subscribe), sample.iter())
+            .await
+            .expect("subscription failed");
+
+        self.ready_set.write().await.extend(sample);
 
         self.handle.replace(handle.clone());
 
@@ -267,3 +347,49 @@ where
             .context(SieveError)
     }
 }
+
+// #[cfg(test)]
+// mod test {
+//     use super::*;
+
+//     use drop::test::DummyManager;
+
+//     use sieve::batched::test::{generate_batch, generate_sieve_sequence};
+//     use sieve::batched::Fixed;
+
+//     /// Generate a sequence of `Ready` Message with specified conflicts
+//     pub fn generate_ready_echoes<M>(
+//         digest: Digest,
+//         sequences: impl Iterator<Item = Sequence> + Clone,
+//         count: usize,
+//     ) -> impl Iterator<Item = BatchedContagionMessage<u32>>
+//     where
+//         M: Message,
+//     {
+//         std::iter::repeat(sequences)
+//             .zip((0..count).map(|x| x as u32))
+//             .map(move |(seqs, x)| BatchedContagionMessage::Ready(digest, seqs.collect()))
+//     }
+
+//     #[tokio::test]
+//     async fn correct_delivery_with_conflicts() {
+//         drop::test::init_logger();
+
+//         const PEER_COUNT: usize = 10;
+//         const BATCH_SIZE: usize = 20;
+//         const CONFLICT_RANGE: std::ops::Range<usize> = 0..BATCH_SIZE / 2;
+
+//         let config = BatchedContagionConfig::default();
+//         let contagion = BatchedContagion::new(KeyPair::random(), config, Fixed::new_local());
+//         let messages = generate_sieve_sequence(PEER_COUNT, BATCH_SIZE, CONFLICT_RANGE)
+//             .map(Into::into)
+//             .chain(generate_ready_echoes());
+//         let mut manager = DummyManager::new(messages);
+
+//         let mut handle = manager.run(contagion).await;
+
+//         let batch = handle.deliver().await.expect("deliver failed");
+
+//         assert_eq!(batch.digest(), digest, "wrong batch delivered");
+//     }
+// }
