@@ -19,7 +19,7 @@ use drop::system::manager::Handle;
 use drop::system::sender::{ConvertSender, SenderError};
 use drop::system::{message, Message, Processor, Sampler, Sender};
 
-use futures::stream::StreamExt;
+use futures::stream::{self, StreamExt};
 
 use sieve::batched::{
     BatchedSieve, BatchedSieveError, BatchedSieveHandle, BatchedSieveMessage, EchoHandle,
@@ -37,8 +37,8 @@ use tracing::debug;
 mod config;
 pub use config::{BatchedContagionConfig, BatchedContagionConfigBuilder};
 
-mod pending;
-pub use pending::PendingSequences;
+mod seen;
+pub use seen::SeenHandle;
 
 #[derive(Debug, Snafu)]
 /// Errors encountered by the `BatchedContagion` algorithm
@@ -109,7 +109,8 @@ where
     handle: Option<Arc<Mutex<BatchedSieveHandle<M>>>>,
     delivery: Option<mpsc::Sender<FilteredBatch<M>>>,
 
-    batches: RwLock<HashMap<Digest, Arc<PendingSequences>>>,
+    seen: SeenHandle,
+    batches: RwLock<HashMap<Digest, FilteredBatch<M>>>,
 
     ready_set: RwLock<HashSet<PublicKey>>,
 
@@ -137,11 +138,12 @@ where
 
             ready_agent: Default::default(),
 
+            seen: SeenHandle::new(config.channel_cap()),
             batches: Default::default(),
         }
     }
 
-    async fn try_deliver(&self) -> Option<FilteredBatch<M>> {
+    async fn deliver_from_sieve(&self) -> Option<FilteredBatch<M>> {
         self.handle
             .as_ref()?
             .lock()
@@ -168,15 +170,16 @@ where
                 } else {
                     None
                 }
-            })
-            .collect::<BTreeSet<_>>()
-            .await;
+            });
 
-        let status = self.batches.read().await.get(&digest).map(Clone::clone)?;
+        let delivery = self.seen.register_delivered(digest, correct).await;
 
-        let delivery = status.register_delivered(correct.iter()).await;
-
-        todo!()
+        self.batches
+            .read()
+            .await
+            .get(&digest)
+            .map(|batch| batch.include(delivery))
+            .filter(|batch| !batch.is_empty())
     }
 }
 
@@ -223,18 +226,23 @@ where
                     .await
                     .context(SieveError)?;
 
-                if let Some(delivered) = self.try_deliver().await {
+                // FIXME: there should be a check for sequences that are newly seen but already have enough echoes
+
+                if let Some(delivered) = self.deliver_from_sieve().await {
                     let digest = *delivered.digest();
 
                     let new_seqs = {
-                        let mut guard = self.batches.write().await;
+                        let mut guard = self.seen.write().await;
                         let batch = guard.entry(*delivered.digest()).or_default();
 
                         batch.register_pending(delivered.included()).await
                     };
 
                     if !new_seqs.is_empty() {
-                        debug!("announcing new batch {} to subscribers", digest);
+                        debug!(
+                            "announcing new payloads from batch {} to subscribers",
+                            digest
+                        );
 
                         sender
                             .send_many(
@@ -249,10 +257,20 @@ where
                 }
             }
 
-            BatchedContagionMessage::Subscribe => {
-                if self.subscribers.write().await.insert(from) {
-                    todo!("broadcast everything state info required");
-                }
+            BatchedContagionMessage::Subscribe if self.subscribers.write().await.insert(from) => {
+                let guard = self.seen.read().await;
+                let echoes = stream::iter(guard.iter()).then(|(digest, seqs)| async move {
+                    let acks = seqs.get_known().await;
+
+                    Arc::new(BatchedContagionMessage::Ready(*digest, acks))
+                });
+
+                sender
+                    .send_many_to_one_stream(echoes, &from)
+                    .await
+                    .context(Network {
+                        when: "replying to subscribe request",
+                    })?;
             }
 
             e => debug!("ignored {:?} from {}", e, from),
@@ -348,48 +366,48 @@ where
     }
 }
 
-// #[cfg(test)]
-// mod test {
-//     use super::*;
+#[cfg(test)]
+mod test {
+    use super::*;
 
-//     use drop::test::DummyManager;
+    use drop::test::DummyManager;
 
-//     use sieve::batched::test::{generate_batch, generate_sieve_sequence};
-//     use sieve::batched::Fixed;
+    use sieve::batched::test::{generate_batch, generate_sieve_sequence};
+    use sieve::batched::Fixed;
 
-//     /// Generate a sequence of `Ready` Message with specified conflicts
-//     pub fn generate_ready_echoes<M>(
-//         digest: Digest,
-//         sequences: impl Iterator<Item = Sequence> + Clone,
-//         count: usize,
-//     ) -> impl Iterator<Item = BatchedContagionMessage<u32>>
-//     where
-//         M: Message,
-//     {
-//         std::iter::repeat(sequences)
-//             .zip((0..count).map(|x| x as u32))
-//             .map(move |(seqs, x)| BatchedContagionMessage::Ready(digest, seqs.collect()))
-//     }
+    /// Generate a sequence of `Ready` Message with specified conflicts
+    pub fn generate_ready_echoes<M>(
+        digest: Digest,
+        sequences: impl Iterator<Item = Sequence> + Clone,
+        count: usize,
+    ) -> impl Iterator<Item = BatchedContagionMessage<u32>>
+    where
+        M: Message,
+    {
+        std::iter::repeat(sequences)
+            .zip((0..count).map(|x| x as u32))
+            .map(move |(seqs, x)| BatchedContagionMessage::Ready(digest, seqs.collect()))
+    }
 
-//     #[tokio::test]
-//     async fn correct_delivery_with_conflicts() {
-//         drop::test::init_logger();
+    #[tokio::test]
+    async fn correct_delivery_with_conflicts() {
+        drop::test::init_logger();
 
-//         const PEER_COUNT: usize = 10;
-//         const BATCH_SIZE: usize = 20;
-//         const CONFLICT_RANGE: std::ops::Range<usize> = 0..BATCH_SIZE / 2;
+        const PEER_COUNT: usize = 10;
+        const BATCH_SIZE: usize = 20;
+        const CONFLICT_RANGE: std::ops::Range<usize> = 0..BATCH_SIZE / 2;
 
-//         let config = BatchedContagionConfig::default();
-//         let contagion = BatchedContagion::new(KeyPair::random(), config, Fixed::new_local());
-//         let messages = generate_sieve_sequence(PEER_COUNT, BATCH_SIZE, CONFLICT_RANGE)
-//             .map(Into::into)
-//             .chain(generate_ready_echoes());
-//         let mut manager = DummyManager::new(messages);
+        let config = BatchedContagionConfig::default();
+        let contagion = BatchedContagion::new(KeyPair::random(), config, Fixed::new_local());
+        let messages = generate_sieve_sequence(PEER_COUNT, BATCH_SIZE, CONFLICT_RANGE)
+            .map(Into::into)
+            .chain(generate_ready_echoes());
+        let mut manager = DummyManager::new(messages, PEER_COUNT);
 
-//         let mut handle = manager.run(contagion).await;
+        let mut handle = manager.run(contagion).await;
 
-//         let batch = handle.deliver().await.expect("deliver failed");
+        let batch = handle.deliver().await.expect("deliver failed");
 
-//         assert_eq!(batch.digest(), digest, "wrong batch delivered");
-//     }
-// }
+        assert_eq!(batch.digest(), digest, "wrong batch delivered");
+    }
+}
