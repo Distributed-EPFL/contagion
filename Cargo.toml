@@ -12,6 +12,7 @@ drop = { git = "https://github.com/Distributed-EPFL/drop", branch = "feature/ref
 sieve = { git = "https://github.com/Distributed-EPFL/sieve", branch = "batched" }
 snafu = "0.6"
 tokio = { version = "1", features = [ "sync" ] }
+tokio-stream = "0.1"
 futures = "0.3"
 serde = "1.0"
 tracing = "0.1"
