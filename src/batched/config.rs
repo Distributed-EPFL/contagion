@@ -44,6 +44,11 @@ impl BatchedContagionConfig {
         Self::threshold_cmp(v, self.ready_threshold)
     }
 
+    /// Get the configuration channel capacity
+    pub fn channel_cap(&self) -> usize {
+        self.sieve.murmur.channel_cap()
+    }
+
     fn threshold_cmp(v: i32, threshold: usize) -> bool {
         v > 0 && v as usize >= threshold
     }
