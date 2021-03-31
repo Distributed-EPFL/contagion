@@ -58,14 +58,6 @@ enum State {
 }
 
 impl State {
-    fn is_pending(&self) -> bool {
-        matches!(self, Self::Pending)
-    }
-
-    fn is_delivered(&self) -> bool {
-        matches!(self, Self::Delivered)
-    }
-
     fn set_delivered(&mut self) -> bool {
         if let Self::Pending = self {
             *self = Self::Delivered;
