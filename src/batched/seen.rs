@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use super::{Digest, Sequence};
 
+use futures::future::FutureExt;
 use futures::stream::{self, Stream, StreamExt};
 
 use tokio::sync::{mpsc, oneshot, RwLock};
@@ -86,17 +87,43 @@ impl SeenHandle {
     /// Get all seen or delivered sequences from the specified batch
     pub async fn get_seen(&self, digest: Digest) -> Option<impl Stream<Item = Sequence>> {
         let tx = self.get_agent(digest).await?;
-        let (resp, rx) = mpsc::channel(self.capacity);
+
+        Self::get_seen_internal(tx, self.capacity).await
+    }
+
+    async fn get_seen_internal(
+        tx: mpsc::Sender<Command>,
+        capacity: usize,
+    ) -> Option<impl Stream<Item = Sequence>> {
+        let (resp, rx) = mpsc::channel(capacity);
 
         let _ = tx.send(Command::GetSeen(resp)).await;
 
         Some(ReceiverStream::new(rx))
     }
 
+    /// Get all seen sequences for every known batch
+    pub async fn get_known_batches(
+        &self,
+    ) -> impl Stream<Item = (Digest, impl Stream<Item = Sequence>)> {
+        let agents = self
+            .senders
+            .read()
+            .await
+            .iter()
+            .map(|(digest, sender)| (*digest, sender.clone()))
+            .collect::<Vec<_>>();
+        let capacity = self.capacity;
+
+        stream::iter(agents.into_iter()).filter_map(move |(digest, sender)| {
+            Self::get_seen_internal(sender, capacity).map(move |s| s.map(|s| (digest, s)))
+        })
+    }
+
     /// Remove all existing tracking information for the specified batch.
     /// All outstanding request for information from this batch will be processed
     /// before the agent is actually stopped
-    pub fn purge(&self, digest: Digest) {
+    pub async fn purge(&self, digest: Digest) {
         self.senders.write().await.remove(&digest);
     }
 
@@ -142,15 +169,15 @@ impl PendingAgent {
                 match cmd {
                     Command::Seen(sequence, resp) => match self.set.entry(sequence) {
                         Entry::Vacant(e) => {
-                            e.insert(State::Delivered);
-                            resp.send(sequence);
+                            e.insert(State::Seen);
+                            let _ = resp.send(sequence);
                         }
                         _ => continue,
                     },
                     Command::Delivered(sequence, resp) => match self.set.entry(sequence) {
-                        Entry::Occupied(e) => {
+                        Entry::Occupied(mut e) => {
                             if e.get_mut().set_delivered() {
-                                resp.send(sequence);
+                                let _ = resp.send(sequence);
                             }
                         }
                         _ => continue,
@@ -175,4 +202,123 @@ enum Command {
     Seen(Sequence, Channel),
     Delivered(Sequence, Channel),
     GetSeen(mpsc::Sender<Sequence>),
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    use futures::{future, stream};
+
+    use sieve::batched::test::generate_batch;
+
+    const SIZE: usize = 10;
+
+    #[tokio::test]
+    async fn purging() {
+        let batch = generate_batch(SIZE);
+        let digest = *batch.info().digest();
+        let handle = SeenHandle::new(32);
+
+        handle
+            .register_seen(digest, stream::iter(0..batch.len()))
+            .await
+            .enumerate()
+            .for_each(|(exp, seq)| async move {
+                assert_eq!(exp as Sequence, seq, "incorrect sequence ordering");
+            })
+            .await;
+
+        handle.purge(digest).await;
+
+        let result = handle.get_seen(digest).await;
+
+        assert!(result.is_none(), "information was not purged");
+    }
+
+    #[tokio::test]
+    async fn seen() {
+        let batch = generate_batch(SIZE);
+        let digest = *batch.info().digest();
+        let handle = SeenHandle::new(32);
+        let seen = stream::iter((0..batch.len()).step_by(2));
+
+        handle
+            .register_seen(digest, seen.clone())
+            .await
+            .enumerate()
+            .for_each(|(curr, seq)| async move {
+                assert_eq!(curr as Sequence * 2, seq);
+            })
+            .await;
+
+        handle
+            .get_seen(digest)
+            .await
+            .expect("no data for batch")
+            .zip(seen)
+            .for_each(|(actual, exp)| async move {
+                assert_eq!(actual, exp);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn seen_then_delivered() {
+        let batch = generate_batch(SIZE);
+        let digest = *batch.info().digest();
+        let handle = SeenHandle::new(32);
+        let range = 0..batch.len();
+
+        handle
+            .register_seen(digest, stream::iter(range.clone()))
+            .await
+            .enumerate()
+            .for_each(|(exp, actual)| async move {
+                assert_eq!(exp as Sequence, actual);
+            })
+            .await;
+
+        let new_seen = handle
+            .register_seen(digest, stream::once(future::ready(0)))
+            .await
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(new_seen.is_empty(), "could see sequences twice");
+
+        handle
+            .register_delivered(digest, stream::iter(range))
+            .await
+            .enumerate()
+            .for_each(|(exp, actual)| async move {
+                assert_eq!(exp as Sequence, actual);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn delivered_then_seen() {
+        let batch = generate_batch(SIZE);
+        let digest = *batch.info().digest();
+        let handle = SeenHandle::new(32);
+        let range = 0..batch.len();
+
+        let delivered = handle
+            .register_delivered(digest, stream::iter(range.clone()))
+            .await
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(delivered.is_empty(), "could deliver without seeing first");
+
+        handle
+            .register_seen(digest, stream::iter(range))
+            .await
+            .enumerate()
+            .for_each(|(exp, actual)| async move {
+                assert_eq!(exp as Sequence, actual);
+            })
+            .await;
+    }
 }
