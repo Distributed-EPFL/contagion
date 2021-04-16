@@ -27,7 +27,7 @@ use postage::sink::Sink as _;
 use postage::stream::Stream as _;
 
 use sieve::{EchoHandle, Sieve, SieveError, SieveHandle, SieveMessage};
-pub use sieve::{FilteredBatch, Fixed, Payload, RdvPolicy, Sequence};
+pub use sieve::{FilteredBatch, Fixed, Payload, RdvPolicy, RoundRobin, Sequence};
 
 use serde::{Deserialize, Serialize};
 
