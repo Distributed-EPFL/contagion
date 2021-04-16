@@ -2,14 +2,14 @@ use derive_builder::Builder;
 
 use serde::{Deserialize, Serialize};
 
-use sieve::batched::BatchedSieveConfig;
+use sieve::SieveConfig;
 
 #[derive(Builder, Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "cli", derive(structopt::StructOpt))]
 /// A struct holding all necessary information required to configure a [`BatchedContagion`] instance
 ///
 /// [`BatchedContagion`]: super::BatchedContagion
-pub struct BatchedContagionConfig {
+pub struct ContagionConfig {
     #[cfg_attr(feature = "cli", structopt(short, long))]
     #[doc = "the threshold  of ready messages required to mark payload as ready"]
     pub ready_threshold: usize,
@@ -20,10 +20,10 @@ pub struct BatchedContagionConfig {
 
     #[cfg_attr(feature = "cli", structopt(flatten))]
     #[doc = "configuration for the underlying sieve algorithm"]
-    pub sieve: BatchedSieveConfig,
+    pub sieve: SieveConfig,
 }
 
-impl BatchedContagionConfig {
+impl ContagionConfig {
     /// Get the ready threshold of messages for this configuration
     pub fn ready_threshold(&self) -> usize {
         self.ready_threshold
@@ -35,7 +35,7 @@ impl BatchedContagionConfig {
     }
 
     /// Get the inner `BatchedSieveConfig`
-    pub fn sieve(&self) -> &BatchedSieveConfig {
+    pub fn sieve(&self) -> &SieveConfig {
         &self.sieve
     }
 
@@ -54,12 +54,12 @@ impl BatchedContagionConfig {
     }
 }
 
-impl Default for BatchedContagionConfig {
+impl Default for ContagionConfig {
     fn default() -> Self {
         Self {
             ready_threshold: 10,
             sample_size: 10,
-            sieve: BatchedSieveConfig::default(),
+            sieve: SieveConfig::default(),
         }
     }
 }
