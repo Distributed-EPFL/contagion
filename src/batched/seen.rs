@@ -106,7 +106,7 @@ impl SeenHandle {
     #[allow(clippy::needless_collect)]
     pub async fn get_known_batches(
         &self,
-    ) -> impl Stream<Item = (Digest, impl Stream<Item = Sequence>)> + '_ {
+    ) -> impl Stream<Item = (Digest, impl Stream<Item = Sequence>)> {
         let agents = self
             .senders
             .read()
