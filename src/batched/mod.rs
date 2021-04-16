@@ -27,7 +27,7 @@ use postage::sink::Sink as _;
 use postage::stream::Stream as _;
 
 use sieve::{EchoHandle, Sieve, SieveError, SieveHandle, SieveMessage};
-pub use sieve::{FilteredBatch, Payload, RdvPolicy, Sequence};
+pub use sieve::{FilteredBatch, Fixed, Payload, RdvPolicy, Sequence};
 
 use serde::{Deserialize, Serialize};
 
@@ -385,8 +385,6 @@ where
     S: Sender<ContagionMessage<M>>,
 {
     fn default() -> Self {
-        use sieve::Fixed;
-
         Self::new(
             KeyPair::random(),
             ContagionConfig::default(),
