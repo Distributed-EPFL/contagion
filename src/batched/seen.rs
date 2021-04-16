@@ -103,9 +103,10 @@ impl SeenHandle {
     }
 
     /// Get all seen sequences for every known batch
+    #[allow(clippy::needless_collect)]
     pub async fn get_known_batches(
         &self,
-    ) -> impl Stream<Item = (Digest, impl Stream<Item = Sequence>)> {
+    ) -> impl Stream<Item = (Digest, impl Stream<Item = Sequence>)> + '_ {
         let agents = self
             .senders
             .read()
@@ -113,6 +114,7 @@ impl SeenHandle {
             .iter()
             .map(|(digest, sender)| (*digest, sender.clone()))
             .collect::<Vec<_>>();
+
         let capacity = self.capacity;
 
         stream::iter(agents.into_iter()).filter_map(move |(digest, sender)| {
@@ -127,6 +129,7 @@ impl SeenHandle {
         self.senders.write().await.remove(&digest);
     }
 
+    /// Get the agent channel for some batch without inserting it if it doesn't exist
     async fn get_agent(&self, digest: Digest) -> Option<mpsc::Sender<Command>> {
         self.senders.read().await.get(&digest).map(Clone::clone)
     }
@@ -210,7 +213,7 @@ mod test {
 
     use futures::{future, stream};
 
-    use sieve::batched::test::generate_batch;
+    use sieve::test::generate_batch;
 
     const SIZE: usize = 10;
 
