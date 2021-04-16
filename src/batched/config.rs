@@ -14,9 +14,9 @@ pub struct ContagionConfig {
     #[doc = "the threshold  of ready messages required to mark payload as ready"]
     pub ready_threshold: usize,
 
-    #[cfg_attr(feature = "cli", structopt(short, long))]
+    #[cfg_attr(feature = "cli", structopt(long))]
     #[doc = "the expected size of the gossip set"]
-    pub sample_size: usize,
+    pub contagion_sample_size: usize,
 
     #[cfg_attr(feature = "cli", structopt(flatten))]
     #[doc = "configuration for the underlying sieve algorithm"]
@@ -31,7 +31,7 @@ impl ContagionConfig {
 
     /// Get the expected sample size
     pub fn sample_size(&self) -> usize {
-        self.sample_size
+        self.contagion_sample_size
     }
 
     /// Get the inner `BatchedSieveConfig`
@@ -58,7 +58,7 @@ impl Default for ContagionConfig {
     fn default() -> Self {
         Self {
             ready_threshold: 10,
-            sample_size: 10,
+            contagion_sample_size: 10,
             sieve: SieveConfig::default(),
         }
     }
