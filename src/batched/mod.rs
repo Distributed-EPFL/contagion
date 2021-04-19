@@ -535,7 +535,7 @@ pub mod test {
     }
 
     #[tokio::test]
-    async fn generate_deliver_with_conflicts() {
+    async fn deliver_with_conflicts() {
         drop::test::init_logger();
 
         const BATCH_SIZE: usize = 40;
@@ -547,7 +547,7 @@ pub mod test {
     }
 
     #[tokio::test]
-    async fn correct_delivery_no_conflicts() {
+    async fn deliver_no_conflicts() {
         use std::iter;
 
         drop::test::init_logger();
