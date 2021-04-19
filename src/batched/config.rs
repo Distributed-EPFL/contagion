@@ -24,21 +24,6 @@ pub struct ContagionConfig {
 }
 
 impl ContagionConfig {
-    /// Get the ready threshold of messages for this configuration
-    pub fn ready_threshold(&self) -> usize {
-        self.ready_threshold
-    }
-
-    /// Get the expected sample size
-    pub fn sample_size(&self) -> usize {
-        self.contagion_sample_size
-    }
-
-    /// Get the inner `BatchedSieveConfig`
-    pub fn sieve(&self) -> &SieveConfig {
-        &self.sieve
-    }
-
     /// Check if the ready threshold has been reached
     pub fn ready_threshold_cmp(&self, v: i32) -> bool {
         Self::threshold_cmp(v, self.ready_threshold)
@@ -46,7 +31,7 @@ impl ContagionConfig {
 
     /// Get the configuration channel capacity
     pub fn channel_cap(&self) -> usize {
-        self.sieve.murmur.channel_cap()
+        self.sieve.murmur.channel_cap
     }
 
     fn threshold_cmp(v: i32, threshold: usize) -> bool {
