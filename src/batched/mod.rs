@@ -197,10 +197,7 @@ where
             .inspect(|(seq, count)| {
                 debug!(
                     "have {}/{} acks for seq {} of batch {}",
-                    count,
-                    self.config.ready_threshold(),
-                    seq,
-                    digest
+                    count, self.config.ready_threshold, seq, digest
                 );
             })
             .filter_map(|(seq, count)| async move {
@@ -371,7 +368,7 @@ where
 
         self.handle.replace(Mutex::new(handle.clone()));
 
-        let (tx, rx) = dispatch::channel(self.config.sieve.murmur.channel_cap());
+        let (tx, rx) = dispatch::channel(self.config.sieve.murmur.channel_cap);
 
         self.delivery.replace(tx);
 
@@ -477,33 +474,58 @@ pub mod test {
             .take(count)
     }
 
+    pub fn generate_single_echo(
+        digest: Digest,
+        seq: Sequence,
+        count: usize,
+    ) -> impl Iterator<Item = ContagionMessage<u32>> {
+        std::iter::repeat(seq)
+            .map(move |seq| ContagionMessage::ReadyOne(digest, seq))
+            .take(count)
+    }
+
     /// Generate the required sequence of messages in order for contagion to deliver a batch
     /// with a specified set of conflicts
     pub fn generate_contagion_sequence(
         batch_size: usize,
         peer_count: usize,
-        conflicts: impl Iterator<Item = Sequence> + Clone,
+        sieve_conflicts: impl Iterator<Item = Sequence> + Clone,
+        contagion_conflicts: impl Iterator<Item = Sequence> + Clone,
     ) -> impl Iterator<Item = ContagionMessage<u32>> {
         let batch = generate_batch(batch_size);
         let digest = *batch.info().digest();
+        let contagion = generate_ready_echoes(digest, contagion_conflicts, peer_count);
 
-        generate_sieve_sequence(peer_count, batch, conflicts.clone())
+        generate_sieve_sequence(peer_count, batch, sieve_conflicts)
             .map(Into::into)
-            .chain(generate_ready_echoes(digest, conflicts, peer_count))
+            .chain(contagion)
     }
 
-    async fn do_test<C>(size: usize, peers: usize, conflicts: C)
+    async fn do_test<C>(size: usize, peers: usize, sieve_conflicts: C, contagion_conflicts: C)
     where
         C: ExactSizeIterator<Item = Sequence> + Clone,
     {
         let batch = generate_batch(size);
         let digest = *batch.info().digest();
-        let conflicts = conflicts.collect::<Vec<_>>();
+
+        let sieve_conflicts = sieve_conflicts.collect::<Vec<_>>();
+        let contagion_conflicts = contagion_conflicts.collect::<Vec<_>>();
+
+        let conflicts = sieve_conflicts
+            .iter()
+            .copied()
+            .chain(contagion_conflicts.iter().copied())
+            .collect::<HashSet<_>>();
 
         let config = ContagionConfig::default();
         let contagion = Contagion::new(KeyPair::random(), config, Fixed::new_local());
 
-        let messages = generate_contagion_sequence(size, peers, conflicts.iter().copied());
+        let messages = generate_contagion_sequence(
+            size,
+            peers,
+            sieve_conflicts.iter().copied(),
+            contagion_conflicts.iter().copied(),
+        );
 
         let mut manager = DummyManager::new(messages, peers);
 
@@ -535,7 +557,7 @@ pub mod test {
     }
 
     #[tokio::test]
-    async fn deliver_with_conflicts() {
+    async fn deliver_with_same_conflicts() {
         drop::test::init_logger();
 
         const BATCH_SIZE: usize = 40;
@@ -543,7 +565,7 @@ pub mod test {
         const CONFLICTS: std::ops::Range<Sequence> = 0..CONFLICT_END as Sequence;
         const CONFLICT_END: usize = 20;
 
-        do_test(BATCH_SIZE, PEER_COUNT, CONFLICTS).await;
+        do_test(BATCH_SIZE, PEER_COUNT, CONFLICTS, CONFLICTS).await;
     }
 
     #[tokio::test]
@@ -555,6 +577,6 @@ pub mod test {
         const BATCH_SIZE: usize = 40;
         const PEER_COUNT: usize = 20;
 
-        do_test(BATCH_SIZE, PEER_COUNT, iter::empty()).await;
+        do_test(BATCH_SIZE, PEER_COUNT, iter::empty(), iter::empty()).await;
     }
 }
