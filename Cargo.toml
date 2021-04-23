@@ -9,7 +9,7 @@ license = "AGPL-3"
 
 [dependencies]
 drop = { git = "https://github.com/Distributed-EPFL/drop", branch = "feature/refactor", features = [ "system" ] }
-sieve = { git = "https://github.com/Distributed-EPFL/sieve", branch = "batched" }
+sieve = { git = "https://github.com/Distributed-EPFL/sieve" }
 snafu = "0.6"
 tokio = { version = "1", features = [ "sync" ] }
 tokio-stream = "0.1"
@@ -22,7 +22,7 @@ structopt = { version = "0.3", optional = true }
 
 [dev-dependencies]
 drop = { git = "https://github.com/Distributed-EPFL/drop", branch = "feature/refactor", features = [ "test" ] }
-sieve = { git = "https://github.com/Distributed-EPFL/sieve", branch = "batched", features = [ "test" ] }
+sieve = { git = "https://github.com/Distributed-EPFL/sieve", features = [ "test" ] }
 tokio = { version = "1", features = [ "macros" ] } 
 
 [features]
