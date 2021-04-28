@@ -8,7 +8,7 @@
 //! [`BatchedContagion`]: crate::batched::BatchedContagion
 //! [`RdvPolicy`]: crate::batched::RdvPolicy
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use drop::async_trait;
@@ -20,7 +20,7 @@ use drop::system::sender::{ConvertSender, SenderError};
 use drop::system::{message, Message, Processor, Sampler, Sender};
 
 use futures::future::{FutureExt, OptionFuture};
-use futures::stream::{self, Stream, StreamExt};
+use futures::stream::{Stream, StreamExt};
 
 use postage::dispatch;
 use postage::sink::Sink as _;
@@ -177,37 +177,64 @@ where
             .map(|batch| batch.sequence())
     }
 
-    /// Check which sequences can be delivered after receiving n-acks for the given
-    /// sequences
-    async fn deliverable(
-        &self,
+    async fn deliver(&self, batch: FilteredBatch<M>) -> Result<(), ContagionError> {
+        let mut delivery = self.delivery.as_ref().map(Clone::clone).context(NotSetup)?;
+
+        debug!(
+            "delivering {} sequences from {}",
+            batch.len(),
+            batch.digest(),
+        );
+
+        delivery
+            .send(batch)
+            .await
+            .map_err(|_| snafu::NoneError)
+            .context(Channel)
+    }
+
+    /// Register echoes for the given set of sequences
+    async fn register_echoes<'a>(
+        &'a self,
         digest: Digest,
         from: PublicKey,
-        seqs: &[Sequence],
-    ) -> Option<FilteredBatch<M>> {
+        included: impl Iterator<Item = Sequence> + 'a,
+    ) -> impl Stream<Item = Sequence> + 'a {
         let config = self.config;
-        let size = self.size_from_digest(&digest).await?;
 
-        let included = (0..size).filter(|x| seqs.contains(&x));
-
-        let correct = self
-            .ready_agent
+        self.ready_agent
             .send_many(digest, from, included)
             .await
-            .inspect(|(seq, count)| {
+            .inspect(move |(seq, count)| {
                 debug!(
                     "have {}/{} acks for seq {} of batch {}",
-                    count, self.config.ready_threshold, seq, digest
+                    count, config.ready_threshold, seq, digest
                 );
             })
-            .filter_map(|(seq, count)| async move {
+            .filter_map(move |(seq, count)| async move {
                 if config.ready_threshold_cmp(count) {
                     Some(seq)
                 } else {
                     None
                 }
             })
-            .inspect(|seq| debug!("ready to deliver {} from {}", seq, digest));
+            .inspect(move |seq| debug!("ready to deliver {} from {}", seq, digest))
+    }
+
+    /// Check which sequences can be delivered after receiving n-acks for the given
+    /// sequences
+    async fn deliverable(
+        &self,
+        digest: Digest,
+        from: PublicKey,
+        excluded: impl IntoIterator<Item = Sequence>,
+    ) -> Option<FilteredBatch<M>> {
+        let size = self.size_from_digest(&digest).await?;
+        let seqs = excluded.into_iter().collect::<BTreeSet<_>>();
+
+        let included = (0..size).filter(|x| seqs.contains(&x));
+
+        let correct = self.register_echoes(digest, from, included).await;
 
         let delivery = self.seen.register_delivered(digest, correct).await;
         OptionFuture::from(
@@ -255,7 +282,7 @@ where
 
                 excluding.sort_unstable();
 
-                if let Some(batch) = self.deliverable(*digest, from, &excluding).await {
+                if let Some(batch) = self.deliverable(*digest, from, excluding).await {
                     self.delivery
                         .as_ref()
                         .context(NotSetup)?
@@ -267,59 +294,35 @@ where
                 }
             }
 
-            ContagionMessage::ReadyOne(digest, sequence) => {
-                todo!("register single ack for payload {} in {}", sequence, digest);
+            ContagionMessage::ReadyOne(_digest, _sequence) => {
+                todo!()
             }
 
             ContagionMessage::Sieve(sieve) => {
                 let sieve_sender = Arc::new(ConvertSender::new(sender.clone()));
+
                 self.sieve
                     .process(Arc::new(sieve.clone()), from, sieve_sender)
                     .await
                     .context(SieveFail)?;
 
-                // FIXME: there should be a check for sequences that are newly seen but already have enough echoes
-
                 if let Some(delivered) = self.deliver_from_sieve().await {
                     let digest = *delivered.digest();
 
-                    debug!("new delivery from sieve for {}", digest);
+                    debug!(
+                        "new delivery from sieve for {} containing {} sequences",
+                        digest,
+                        delivered.len() - delivered.excluded_len()
+                    );
 
-                    let new_seqs = self
-                        .seen
-                        .register_seen(digest, stream::iter(delivered.included()))
-                        .await;
-
-                    let new = new_seqs.size_hint().1.expect("bad stream type");
-
-                    futures::pin_mut!(new_seqs);
-
-                    let mut excluded = Vec::new();
-                    let range = 0..delivered.sequence();
-
-                    while let Some(seq) = new_seqs.next().await {
-                        for curr in range.clone() {
-                            if curr == seq {
-                                excluded.push(seq);
-                            }
-                        }
-                    }
-
-                    if new != 0 {
+                    if let Some(deliverable) =
+                        self.deliverable(digest, from, delivered.excluded()).await
+                    {
                         debug!(
-                            "announcing new payloads from batch {} to subscribers",
-                            digest
+                            "delivering new batch with {} sequences included",
+                            deliverable.len()
                         );
-
-                        sender
-                            .send_many(
-                                Arc::new(ContagionMessage::Ready(digest, excluded)),
-                                self.subscribers.read().await.iter(),
-                            )
-                            .await
-                            .context(Network {
-                                when: "sending echoes",
-                            })?;
+                        self.deliver(deliverable).await?;
                     }
                 }
             }
@@ -327,7 +330,7 @@ where
             ContagionMessage::Subscribe if self.subscribers.write().await.insert(from) => {
                 let echoes = self.seen.get_known_batches().await.then(|(digest, seqs)| {
                     seqs.collect::<Vec<_>>()
-                        .map(move |acks| Arc::new(ContagionMessage::Ready(digest, acks)))
+                        .map(move |acks| ContagionMessage::Ready(digest, acks))
                 });
 
                 sender
@@ -344,12 +347,12 @@ where
         Ok(())
     }
 
-    async fn output<SA>(&mut self, sampler: Arc<SA>, sender: Arc<S>) -> Self::Handle
+    async fn setup<SA>(&mut self, sampler: Arc<SA>, sender: Arc<S>) -> Self::Handle
     where
         SA: Sampler,
     {
         let sieve_sender = Arc::new(ConvertSender::new(sender.clone()));
-        let handle = self.sieve.output(sampler.clone(), sieve_sender).await;
+        let handle = self.sieve.setup(sampler.clone(), sieve_sender).await;
 
         let handle = handle;
         let keys = sender.keys().await;
@@ -360,7 +363,7 @@ where
             .expect("sampling failed");
 
         sender
-            .send_many(Arc::new(ContagionMessage::Subscribe), sample.iter())
+            .send_many(ContagionMessage::Subscribe, sample.iter())
             .await
             .expect("subscription failed");
 
@@ -373,6 +376,14 @@ where
         self.delivery.replace(tx);
 
         Self::Handle::new(handle, rx)
+    }
+
+    async fn garbage_collection(&self) {
+        todo!()
+    }
+
+    async fn disconnect<SA: Sampler>(&self, _: PublicKey, _: Arc<S>, _: Arc<SA>) {
+        todo!()
     }
 }
 
