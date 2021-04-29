@@ -11,6 +11,9 @@ use tokio::task::{self, JoinHandle};
 
 use tokio_stream::wrappers::ReceiverStream;
 
+use tracing::{debug, debug_span};
+use tracing_futures::Instrument;
+
 #[derive(Copy, Clone, Debug)]
 enum State {
     Seen,
@@ -142,7 +145,7 @@ impl SeenHandle {
             .or_insert_with(|| {
                 let (tx, rx) = mpsc::channel(self.capacity);
 
-                PendingAgent::new(rx).spawn();
+                PendingAgent::new(rx).spawn(digest);
 
                 tx
             })
@@ -166,38 +169,44 @@ impl PendingAgent {
         }
     }
 
-    fn spawn(mut self) -> JoinHandle<Self> {
-        task::spawn(async move {
-            while let Some(cmd) = self.receiver.recv().await {
-                match cmd {
-                    Command::Seen(sequence, resp) => match self.set.entry(sequence) {
-                        Entry::Vacant(e) => {
-                            e.insert(State::Seen);
-                            let _ = resp.send(sequence);
-                        }
-                        _ => continue,
-                    },
-                    Command::Delivered(sequence, resp) => match self.set.entry(sequence) {
-                        Entry::Occupied(mut e) => {
-                            if e.get_mut().set_delivered() {
+    fn spawn(mut self, digest: Digest) -> JoinHandle<Self> {
+        task::spawn(
+            async move {
+                while let Some(cmd) = self.receiver.recv().await {
+                    match cmd {
+                        Command::Seen(sequence, resp) => match self.set.entry(sequence) {
+                            Entry::Vacant(e) => {
+                                debug!("newly seen sequence {}", sequence);
+                                e.insert(State::Seen);
                                 let _ = resp.send(sequence);
                             }
+                            _ => continue,
+                        },
+                        Command::Delivered(sequence, resp) => match self.set.entry(sequence) {
+                            Entry::Occupied(mut e) => {
+                                if e.get_mut().set_delivered() {
+                                    debug!("newly delivered sequence {}", sequence);
+
+                                    let _ = resp.send(sequence);
+                                }
+                            }
+                            _ => continue,
+                        },
+                        Command::GetSeen(channel) => {
+                            stream::iter(self.set.keys().copied())
+                                .zip(stream::repeat(channel))
+                                .for_each(|(seq, channel)| async move {
+                                    let _ = channel.send(seq).await;
+                                })
+                                .await;
                         }
-                        _ => continue,
-                    },
-                    Command::GetSeen(channel) => {
-                        stream::iter(self.set.keys().copied())
-                            .zip(stream::repeat(channel))
-                            .for_each(|(seq, channel)| async move {
-                                let _ = channel.send(seq).await;
-                            })
-                            .await;
                     }
                 }
-            }
 
-            self
-        })
+                self
+            }
+            .instrument(debug_span!("seen_manager", batch=%digest)),
+        )
     }
 }
 
