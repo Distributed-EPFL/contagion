@@ -442,7 +442,7 @@ where
     }
 
     async fn try_deliver(&mut self) -> Result<Option<FilteredBatch<M>>, Self::Error> {
-        todo!()
+        self.receiver.try_recv().ok().context(Channel).map(Some)
     }
 
     async fn broadcast(&mut self, payload: &Payload<M>) -> Result<(), Self::Error> {
