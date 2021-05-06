@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::iter;
+use std::mem;
 use std::sync::Arc;
 
 use drop::async_trait;
@@ -34,7 +35,7 @@ use snafu::{OptionExt, ResultExt, Snafu};
 
 use tokio::sync::{Mutex, RwLock};
 
-use tracing::{debug, trace};
+use tracing::{debug, error, info, trace};
 
 mod config;
 pub use config::{ContagionConfig, ContagionConfigBuilder};
@@ -287,6 +288,19 @@ where
             Some(new_batch)
         }
     }
+
+    async fn subscribe_to<'a, I>(&self, peers: I, sender: &S) -> Result<(), ContagionError>
+    where
+        I: IntoIterator<Item = &'a PublicKey>,
+        I::IntoIter: Send,
+    {
+        sender
+            .send_many(ContagionMessage::Subscribe, peers.into_iter())
+            .await
+            .context(Network {
+                when: "subscribing to peer",
+            })
+    }
 }
 
 #[async_trait]
@@ -410,7 +424,7 @@ where
 
         self.handle.replace(Mutex::new(handle.clone()));
 
-        let (tx, rx) = dispatch::channel(self.config.sieve.murmur.channel_cap);
+        let (tx, rx) = dispatch::channel(self.config.channel_cap());
 
         self.delivery.replace(tx);
 
@@ -421,8 +435,39 @@ where
         todo!()
     }
 
-    async fn disconnect<SA: Sampler>(&self, _: PublicKey, _: Arc<S>, _: Arc<SA>) {
-        todo!()
+    async fn disconnect<SA: Sampler>(&self, peer: PublicKey, sender: Arc<S>, sampler: Arc<SA>) {
+        let mut ready_set = self.ready_set.write().await;
+
+        if ready_set.remove(&peer) {
+            error!("peer {} from our gossip set disconnected", peer);
+
+            let not_gossip = sender
+                .keys()
+                .await
+                .into_iter()
+                .filter(|x| !ready_set.contains(&x));
+
+            match sampler.sample(not_gossip, 1).await {
+                Ok(new) => {
+                    info!("resampled for {} new peers", new.len());
+
+                    ready_set.extend(new.iter().copied());
+
+                    mem::drop(ready_set);
+
+                    if let Err(e) = self.subscribe_to(new.iter(), &sender).await {
+                        error!("Failed to resubscribe after disconnect: {}", e);
+                    }
+                }
+                Err(e) => {
+                    error!("failed to resample following disconnection: {}", e);
+                }
+            }
+        }
+
+        let sender = Arc::new(ConvertSender::new(sender));
+
+        self.sieve.disconnect(peer, sender, sampler).await;
     }
 }
 
