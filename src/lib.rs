@@ -188,7 +188,7 @@ where
         &'a self,
         info: &BatchInfo,
         from: PublicKey,
-        excluded: &'a Vec<Sequence>,
+        excluded: &'a [Sequence],
     ) -> impl Stream<Item = Sequence> + 'a {
         let config = self.config;
         let digest = *info.digest();
@@ -222,7 +222,7 @@ where
         &self,
         info: &BatchInfo,
         from: PublicKey,
-        excluded: &Vec<Sequence>,
+        excluded: &[Sequence],
     ) -> Option<FilteredBatch<M>> {
         debug!("checking echo status for {}", info.digest());
 
