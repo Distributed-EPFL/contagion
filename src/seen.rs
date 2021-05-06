@@ -11,7 +11,7 @@ use tokio::task::{self, JoinHandle};
 
 use tokio_stream::wrappers::ReceiverStream;
 
-use tracing::{debug, debug_span};
+use tracing::{debug, debug_span, error, info, trace, warn};
 use tracing_futures::Instrument;
 
 #[derive(Copy, Clone, Debug)]
@@ -56,12 +56,16 @@ impl SeenHandle {
     ) -> impl Stream<Item = Sequence> {
         let tx = self.get_agent_or_insert(digest).await;
 
+        debug!("requesting seen status for {}", digest);
+
         sequences
             .zip(stream::repeat(tx))
-            .filter_map(|(x, tx)| async move {
+            .filter_map(move |(x, tx)| async move {
                 let (resp, rx) = oneshot::channel();
 
-                let _ = tx.send(Command::Seen(x, resp)).await;
+                if tx.send(Command::Seen(x, resp)).await.is_err() {
+                    error!("agent for batch {} stopped running", digest);
+                };
 
                 rx.await.ok()
             })
@@ -76,19 +80,35 @@ impl SeenHandle {
     ) -> impl Stream<Item = Sequence> {
         let tx = self.get_agent_or_insert(digest).await;
 
+        debug!("requesting delivery status for {}", digest);
+
         sequences
             .zip(stream::repeat(tx))
-            .filter_map(|(x, tx)| async move {
+            .filter_map(move |(x, tx)| async move {
                 let (resp, rx) = oneshot::channel();
 
-                let _ = tx.send(Command::Delivered(x, resp)).await;
+                if tx.send(Command::Delivered(x, resp)).await.is_err() {
+                    error!("agent for batch {} stopped running", digest);
+                }
 
                 rx.await.ok()
             })
     }
 
+    /// Register delivery for an Iterator of sequences and returns a Stream of sequences that were not already delivered
+    pub async fn register_delivered_iter(
+        &self,
+        digest: Digest,
+        seqs: impl IntoIterator<Item = Sequence>,
+    ) -> impl Stream<Item = Sequence> {
+        self.register_delivered(digest, stream::iter(seqs.into_iter()))
+            .await
+    }
+
     /// Get all seen or delivered sequences from the specified batch
     pub async fn get_seen(&self, digest: Digest) -> Option<impl Stream<Item = Sequence>> {
+        trace!("getting all seen sequences from batch {}", digest);
+
         let tx = self.get_agent(digest).await?;
 
         Self::get_seen_internal(tx, self.capacity).await
@@ -172,6 +192,8 @@ impl PendingAgent {
     fn spawn(mut self, digest: Digest) -> JoinHandle<Self> {
         task::spawn(
             async move {
+                debug!("started agent");
+
                 while let Some(cmd) = self.receiver.recv().await {
                     match cmd {
                         Command::Seen(sequence, resp) => match self.set.entry(sequence) {
@@ -182,16 +204,22 @@ impl PendingAgent {
                             }
                             _ => continue,
                         },
-                        Command::Delivered(sequence, resp) => match self.set.entry(sequence) {
-                            Entry::Occupied(mut e) => {
-                                if e.get_mut().set_delivered() {
-                                    debug!("newly delivered sequence {}", sequence);
+                        Command::Delivered(sequence, resp) => {
+                            debug!("checking if {} is already delivered", sequence);
 
-                                    let _ = resp.send(sequence);
+                            match self.set.entry(sequence) {
+                                Entry::Occupied(mut e) => {
+                                    if e.get_mut().set_delivered() {
+                                        debug!("newly delivered sequence {}", sequence);
+
+                                        if resp.send(sequence).is_err() {
+                                            warn!("did not wait for response to delivery status");
+                                        }
+                                    }
                                 }
+                                _ => continue,
                             }
-                            _ => continue,
-                        },
+                        }
                         Command::GetSeen(channel) => {
                             stream::iter(self.set.keys().copied())
                                 .zip(stream::repeat(channel))
@@ -203,6 +231,8 @@ impl PendingAgent {
                     }
                 }
 
+                info!("monitoring agent exiting");
+
                 self
             }
             .instrument(debug_span!("seen_manager", batch=%digest)),
@@ -210,6 +240,7 @@ impl PendingAgent {
     }
 }
 
+#[derive(Debug)]
 enum Command {
     Seen(Sequence, Channel),
     Delivered(Sequence, Channel),
