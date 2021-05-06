@@ -327,7 +327,9 @@ where
                 }
             }
 
-            ContagionMessage::ReadyOne(ref info, sequence) => {
+            ContagionMessage::ReadyOne(ref info, sequence)
+                if self.ready_set.read().await.contains(&from) =>
+            {
                 if let Some(batch) = self
                     .check_echoes_included(info, from, iter::once(sequence))
                     .await
