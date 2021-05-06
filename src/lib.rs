@@ -8,10 +8,10 @@
 //! [`Contagion`]: self::Contagion
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::iter;
 use std::sync::Arc;
 
 use drop::async_trait;
-use drop::crypto::hash::Digest;
 use drop::crypto::key::exchange::PublicKey;
 use drop::crypto::sign::KeyPair;
 use drop::system::manager::Handle;
@@ -81,7 +81,7 @@ where
     /// Echo all sequences in a batch with a set of exceptions
     Ready(BatchInfo, Vec<Sequence>),
     /// Echo only sequence in a batch
-    ReadyOne(Digest, Sequence),
+    ReadyOne(BatchInfo, Sequence),
     #[serde(bound(deserialize = "M: Message"))]
     /// Encapsulated message meant for underlying `BatchedSieve`
     Sieve(SieveMessage<M>),
@@ -124,7 +124,7 @@ where
     delivery: Option<dispatch::Sender<FilteredBatch<M>>>,
 
     seen: SeenHandle,
-    batches: RwLock<HashMap<Digest, FilteredBatch<M>>>,
+    batches: RwLock<HashMap<BatchInfo, FilteredBatch<M>>>,
 
     ready_set: RwLock<HashSet<PublicKey>>,
 
@@ -188,18 +188,18 @@ where
         &'a self,
         info: &BatchInfo,
         from: PublicKey,
-        excluded: &'a [Sequence],
+        included: impl IntoIterator<Item = Sequence> + 'a,
     ) -> impl Stream<Item = Sequence> + 'a {
         let config = self.config;
         let digest = *info.digest();
-
-        let included = (0..info.sequence()).filter(move |seq| !excluded.contains(&seq));
 
         self.ready_agent
             .send_many(
                 digest,
                 from,
-                included.inspect(move |seq| trace!("new echo for {} from {}", seq, digest)),
+                included
+                    .into_iter()
+                    .inspect(move |seq| trace!("new echo for {} from {}", seq, digest)),
             )
             .await
             .inspect(move |(seq, count)| {
@@ -218,16 +218,16 @@ where
             .inspect(move |seq| debug!("now have enough echoes to deliver {} from {}", seq, digest))
     }
 
-    async fn check_echoes(
+    async fn check_echoes_included(
         &self,
         info: &BatchInfo,
         from: PublicKey,
-        excluded: &[Sequence],
+        sequences: impl IntoIterator<Item = Sequence>,
     ) -> Option<FilteredBatch<M>> {
         debug!("checking echo status for {}", info.digest());
 
         let correct = self
-            .register_echoes(info, from, excluded)
+            .register_echoes(info, from, sequences)
             .await
             .collect::<BTreeSet<_>>()
             .await;
@@ -235,7 +235,7 @@ where
         let batch = self
             .batches
             .read()
-            .map(move |x| x.get(info.digest()).map(Clone::clone))
+            .map(move |x| x.get(info).map(Clone::clone))
             .await;
 
         if let Some(batch) = batch {
@@ -247,26 +247,39 @@ where
         }
     }
 
+    async fn check_echoes_excluded(
+        &self,
+        info: &BatchInfo,
+        from: PublicKey,
+        excluded: &[Sequence],
+    ) -> Option<FilteredBatch<M>> {
+        let included = (0..info.sequence()).filter(|x| !excluded.contains(&x));
+
+        self.check_echoes_included(info, from, included).await
+    }
+
     async fn check_for_delivery(&self, batch: FilteredBatch<M>) -> Option<FilteredBatch<M>> {
-        let digest = *batch.digest();
+        let info = *batch.info();
         let included = stream::iter(batch.included());
 
-        let seen = self.seen.register_seen(digest, included).await;
+        let seen = self.seen.register_seen(info, included).await;
         let correct = self
             .ready_agent
-            .get_many_echoes(digest, seen.collect::<Vec<_>>().await.into_iter()) // FIXME: switch this to an Iterator call once it is in sieve
+            .get_many_echoes(*info.digest(), seen.collect::<Vec<_>>().await.into_iter()) // FIXME: switch this to an Iterator call once it is in sieve
             .await
-            .inspect(|(seq, count)| debug!("have {} echoes for seq {} of {}", count, seq, digest));
+            .inspect(|(seq, count)| {
+                debug!("have {} echoes for seq {} of {}", count, seq, info.digest())
+            });
 
         let delivery = self
             .seen
-            .register_delivered(digest, correct.map(|x| x.0))
+            .register_delivered(info, correct.map(|x| x.0))
             .await
-            .inspect(|x| debug!("now ready to deliver {} from batch {}", x, digest));
+            .inspect(|x| debug!("now ready to deliver {} from batch {}", x, info.digest()));
 
         let new_batch = batch.include(delivery.collect::<BTreeSet<_>>().await);
 
-        self.batches.write().await.insert(digest, batch);
+        self.batches.write().await.insert(info, batch);
 
         if new_batch.is_empty() {
             None
@@ -309,13 +322,18 @@ where
 
                 excluding.sort_unstable();
 
-                if let Some(batch) = self.check_echoes(info, from, &excluding).await {
+                if let Some(batch) = self.check_echoes_excluded(info, from, &excluding).await {
                     self.deliver(batch).await?;
                 }
             }
 
-            ContagionMessage::ReadyOne(_digest, _sequence) => {
-                todo!()
+            ContagionMessage::ReadyOne(ref info, sequence) => {
+                if let Some(batch) = self
+                    .check_echoes_included(info, from, iter::once(sequence))
+                    .await
+                {
+                    self.deliver(batch).await?;
+                }
             }
 
             ContagionMessage::Sieve(sieve) => {
@@ -347,17 +365,17 @@ where
             }
 
             ContagionMessage::Subscribe if self.subscribers.write().await.insert(from) => {
-                // let echoes = self.seen.get_known_batches().await.then(|(digest, seqs)| {
-                //     seqs.collect::<Vec<_>>()
-                //         .map(move |acks| ContagionMessage::Ready(*info.digest(), acks))
-                // });
+                let echoes = self.seen.get_known_batches().await.then(|(info, seqs)| {
+                    seqs.collect::<Vec<_>>()
+                        .map(move |acks| ContagionMessage::Ready(info, acks))
+                });
 
-                // sender
-                //     .send_many_to_one_stream(echoes, &from)
-                //     .await
-                //     .context(Network {
-                //         when: "replying to subscribe request",
-                //     })?;
+                sender
+                    .send_many_to_one_stream(echoes, &from)
+                    .await
+                    .context(Network {
+                        when: "replying to subscribe request",
+                    })?;
             }
 
             e => debug!("ignored {:?} from {}", e, from),
@@ -511,12 +529,12 @@ pub mod test {
     }
 
     pub fn generate_single_echo(
-        digest: Digest,
+        info: BatchInfo,
         seq: Sequence,
         count: usize,
     ) -> impl Iterator<Item = ContagionMessage<u32>> {
         std::iter::repeat(seq)
-            .map(move |seq| ContagionMessage::ReadyOne(digest, seq))
+            .map(move |seq| ContagionMessage::ReadyOne(info, seq))
             .take(count)
     }
 

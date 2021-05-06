@@ -1,7 +1,7 @@
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 
-use super::{Digest, Sequence};
+use super::{BatchInfo, Sequence};
 
 use futures::future::FutureExt;
 use futures::stream::{self, Stream, StreamExt};
@@ -35,7 +35,7 @@ type Channel = oneshot::Sender<Sequence>;
 
 /// Handle for the agent that keeps track of which payloads have been seen and/or delivered for each known batch
 pub struct SeenHandle {
-    senders: RwLock<HashMap<Digest, mpsc::Sender<Command>>>,
+    senders: RwLock<HashMap<BatchInfo, mpsc::Sender<Command>>>,
     capacity: usize,
 }
 
@@ -51,12 +51,12 @@ impl SeenHandle {
     /// Register a `Stream` of sequences as seen and returns the ones that weren't already seen or delivered
     pub async fn register_seen(
         &self,
-        digest: Digest,
+        info: BatchInfo,
         sequences: impl Stream<Item = Sequence>,
     ) -> impl Stream<Item = Sequence> {
-        let tx = self.get_agent_or_insert(digest).await;
+        let tx = self.get_agent_or_insert(info).await;
 
-        debug!("requesting seen status for {}", digest);
+        debug!("requesting seen status for {}", info.digest());
 
         sequences
             .zip(stream::repeat(tx))
@@ -64,7 +64,7 @@ impl SeenHandle {
                 let (resp, rx) = oneshot::channel();
 
                 if tx.send(Command::Seen(x, resp)).await.is_err() {
-                    error!("agent for batch {} stopped running", digest);
+                    error!("agent for batch {} stopped running", info.digest());
                 };
 
                 rx.await.ok()
@@ -75,12 +75,12 @@ impl SeenHandle {
     /// that were previously seen but not already delivered
     pub async fn register_delivered(
         &self,
-        digest: Digest,
+        info: BatchInfo,
         sequences: impl Stream<Item = Sequence>,
     ) -> impl Stream<Item = Sequence> {
-        let tx = self.get_agent_or_insert(digest).await;
+        let tx = self.get_agent_or_insert(info).await;
 
-        debug!("requesting delivery status for {}", digest);
+        debug!("requesting delivery status for {}", info.digest());
 
         sequences
             .zip(stream::repeat(tx))
@@ -88,7 +88,7 @@ impl SeenHandle {
                 let (resp, rx) = oneshot::channel();
 
                 if tx.send(Command::Delivered(x, resp)).await.is_err() {
-                    error!("agent for batch {} stopped running", digest);
+                    error!("agent for batch {} stopped running", info.digest());
                 }
 
                 rx.await.ok()
@@ -98,18 +98,18 @@ impl SeenHandle {
     /// Register delivery for an Iterator of sequences and returns a Stream of sequences that were not already delivered
     pub async fn register_delivered_iter(
         &self,
-        digest: Digest,
+        info: BatchInfo,
         seqs: impl IntoIterator<Item = Sequence>,
     ) -> impl Stream<Item = Sequence> {
-        self.register_delivered(digest, stream::iter(seqs.into_iter()))
+        self.register_delivered(info, stream::iter(seqs.into_iter()))
             .await
     }
 
     /// Get all seen or delivered sequences from the specified batch
-    pub async fn get_seen(&self, digest: Digest) -> Option<impl Stream<Item = Sequence>> {
-        trace!("getting all seen sequences from batch {}", digest);
+    pub async fn get_seen(&self, info: BatchInfo) -> Option<impl Stream<Item = Sequence>> {
+        trace!("getting all seen sequences from batch {}", info.digest());
 
-        let tx = self.get_agent(digest).await?;
+        let tx = self.get_agent(info).await?;
 
         Self::get_seen_internal(tx, self.capacity).await
     }
@@ -129,7 +129,7 @@ impl SeenHandle {
     #[allow(clippy::needless_collect)]
     pub async fn get_known_batches(
         &self,
-    ) -> impl Stream<Item = (Digest, impl Stream<Item = Sequence>)> {
+    ) -> impl Stream<Item = (BatchInfo, impl Stream<Item = Sequence>)> {
         let agents = self
             .senders
             .read()
@@ -140,32 +140,32 @@ impl SeenHandle {
 
         let capacity = self.capacity;
 
-        stream::iter(agents.into_iter()).filter_map(move |(digest, sender)| {
-            Self::get_seen_internal(sender, capacity).map(move |s| s.map(|s| (digest, s)))
+        stream::iter(agents.into_iter()).filter_map(move |(info, sender)| {
+            Self::get_seen_internal(sender, capacity).map(move |s| s.map(|s| (info, s)))
         })
     }
 
     /// Remove all existing tracking information for the specified batch.
     /// All outstanding request for information from this batch will be processed
     /// before the agent is actually stopped
-    pub async fn purge(&self, digest: Digest) {
-        self.senders.write().await.remove(&digest);
+    pub async fn purge(&self, info: &BatchInfo) {
+        self.senders.write().await.remove(info);
     }
 
     /// Get the agent channel for some batch without inserting it if it doesn't exist
-    async fn get_agent(&self, digest: Digest) -> Option<mpsc::Sender<Command>> {
-        self.senders.read().await.get(&digest).map(Clone::clone)
+    async fn get_agent(&self, info: BatchInfo) -> Option<mpsc::Sender<Command>> {
+        self.senders.read().await.get(&info).map(Clone::clone)
     }
 
-    async fn get_agent_or_insert(&self, digest: Digest) -> mpsc::Sender<Command> {
+    async fn get_agent_or_insert(&self, info: BatchInfo) -> mpsc::Sender<Command> {
         self.senders
             .write()
             .await
-            .entry(digest)
+            .entry(info)
             .or_insert_with(|| {
                 let (tx, rx) = mpsc::channel(self.capacity);
 
-                PendingAgent::new(rx).spawn(digest);
+                PendingAgent::new(rx).spawn(info);
 
                 tx
             })
@@ -189,7 +189,7 @@ impl PendingAgent {
         }
     }
 
-    fn spawn(mut self, digest: Digest) -> JoinHandle<Self> {
+    fn spawn(mut self, info: BatchInfo) -> JoinHandle<Self> {
         task::spawn(
             async move {
                 debug!("started agent");
@@ -235,7 +235,7 @@ impl PendingAgent {
 
                 self
             }
-            .instrument(debug_span!("seen_manager", batch=%digest)),
+            .instrument(debug_span!("seen_manager", batch=%info.digest())),
         )
     }
 }
@@ -260,11 +260,11 @@ mod test {
     #[tokio::test]
     async fn purging() {
         let batch = generate_batch(SIZE);
-        let digest = *batch.info().digest();
+        let info = *batch.info();
         let handle = SeenHandle::new(32);
 
         handle
-            .register_seen(digest, stream::iter(0..batch.len()))
+            .register_seen(info, stream::iter(0..batch.len()))
             .await
             .enumerate()
             .for_each(|(exp, seq)| async move {
@@ -272,9 +272,9 @@ mod test {
             })
             .await;
 
-        handle.purge(digest).await;
+        handle.purge(&info).await;
 
-        let result = handle.get_seen(digest).await;
+        let result = handle.get_seen(info).await;
 
         assert!(result.is_none(), "information was not purged");
     }
@@ -282,12 +282,12 @@ mod test {
     #[tokio::test]
     async fn seen() {
         let batch = generate_batch(SIZE);
-        let digest = *batch.info().digest();
+        let info = *batch.info();
         let handle = SeenHandle::new(32);
         let seen = stream::iter((0..batch.len()).step_by(2));
 
         handle
-            .register_seen(digest, seen.clone())
+            .register_seen(info, seen.clone())
             .await
             .enumerate()
             .for_each(|(curr, seq)| async move {
@@ -296,7 +296,7 @@ mod test {
             .await;
 
         handle
-            .get_seen(digest)
+            .get_seen(info)
             .await
             .expect("no data for batch")
             .zip(seen)
@@ -309,12 +309,12 @@ mod test {
     #[tokio::test]
     async fn seen_then_delivered() {
         let batch = generate_batch(SIZE);
-        let digest = *batch.info().digest();
+        let info = *batch.info();
         let handle = SeenHandle::new(32);
         let range = 0..batch.len();
 
         handle
-            .register_seen(digest, stream::iter(range.clone()))
+            .register_seen(info, stream::iter(range.clone()))
             .await
             .enumerate()
             .for_each(|(exp, actual)| async move {
@@ -323,7 +323,7 @@ mod test {
             .await;
 
         let new_seen = handle
-            .register_seen(digest, stream::once(future::ready(0)))
+            .register_seen(info, stream::once(future::ready(0)))
             .await
             .collect::<Vec<_>>()
             .await;
@@ -331,7 +331,7 @@ mod test {
         assert!(new_seen.is_empty(), "could see sequences twice");
 
         handle
-            .register_delivered(digest, stream::iter(range))
+            .register_delivered(info, stream::iter(range))
             .await
             .enumerate()
             .for_each(|(exp, actual)| async move {
@@ -343,12 +343,12 @@ mod test {
     #[tokio::test]
     async fn delivered_then_seen() {
         let batch = generate_batch(SIZE);
-        let digest = *batch.info().digest();
+        let info = *batch.info();
         let handle = SeenHandle::new(32);
         let range = 0..batch.len();
 
         let delivered = handle
-            .register_delivered(digest, stream::iter(range.clone()))
+            .register_delivered(info, stream::iter(range.clone()))
             .await
             .collect::<Vec<_>>()
             .await;
@@ -356,7 +356,7 @@ mod test {
         assert!(delivered.is_empty(), "could deliver without seeing first");
 
         handle
-            .register_seen(digest, stream::iter(range))
+            .register_seen(info, stream::iter(range))
             .await
             .enumerate()
             .for_each(|(exp, actual)| async move {
