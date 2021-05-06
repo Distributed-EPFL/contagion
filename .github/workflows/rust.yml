@@ -87,7 +87,7 @@ jobs:
       - name: generate kcov report
         shell: bash
         run: |
-          for file in target/debug/deps/sieve-*; do [ -x "${file}" ] || continue; mkdir -p "target/cov/$(basename $file)"; kcov --exclude-pattern=/.cargo,/usr/lib --verify "target/cov/$(basename $file)" "$file"; done
+          for file in target/debug/deps/contagion-*; do [ -x "${file}" ] || continue; mkdir -p "target/cov/$(basename $file)"; kcov --exclude-pattern=/.cargo,/usr/lib --verify "target/cov/$(basename $file)" "$file"; done
 
       - name: upload coverage
         uses: codecov/codecov-action@v1
