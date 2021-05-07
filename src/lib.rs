@@ -227,11 +227,9 @@ where
     ) -> Option<FilteredBatch<M>> {
         debug!("checking echo status for {}", info.digest());
 
-        let correct = self
-            .register_echoes(info, from, sequences)
-            .await
-            .collect::<BTreeSet<_>>()
-            .await;
+        let correct = self.register_echoes(info, from, sequences).await;
+
+        let delivered = self.seen.register_delivered(*info, correct).await;
 
         let batch = self
             .batches
@@ -242,7 +240,7 @@ where
         if let Some(batch) = batch {
             debug!("ready to deliver some payloads from {}", info.digest());
 
-            Some(batch.include(correct))
+            Some(batch.include(delivered.collect::<BTreeSet<_>>().await))
         } else {
             None
         }
