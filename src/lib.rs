@@ -598,7 +598,9 @@ pub mod test {
             .chain(contagion)
     }
 
-    async fn do_test<C>(size: usize, peers: usize, sieve_conflicts: C, contagion_conflicts: C)
+    /// Perform a test with specified batch size, number of peers and set of conflicts for both contagion
+    /// and sieve
+    pub async fn do_test<C>(size: usize, peers: usize, sieve_conflicts: C, contagion_conflicts: C)
     where
         C: ExactSizeIterator<Item = Sequence> + Clone,
     {
@@ -620,8 +622,8 @@ pub mod test {
         let messages = generate_contagion_sequence(
             batch.clone(),
             peers,
-            sieve_conflicts.iter().copied(),
-            contagion_conflicts.iter().copied(),
+            sieve_conflicts.into_iter(),
+            contagion_conflicts.into_iter(),
         );
 
         let mut manager = DummyManager::new(messages, peers);
@@ -636,6 +638,17 @@ pub mod test {
             conflicts.len(),
             "wrong number of conflicts"
         );
+
+        delivery
+            .iter()
+            .map(|payload| payload.sequence())
+            .for_each(|x| {
+                assert!(
+                    !conflicts.contains(&x),
+                    "delivered conflicting sequence {}",
+                    x
+                )
+            });
 
         batch
             .iter()
