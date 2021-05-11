@@ -37,6 +37,7 @@ jobs:
         name: cargo test
         with:
           command: test
+          args: --all-features
 
   deny:
     name: cargo deny checks
@@ -78,6 +79,7 @@ jobs:
         name: cargo test
         with:
           command: test
+          args: --all-features
 
       - name: install kcov
         uses: ryankurte/action-apt@v0.2.0
