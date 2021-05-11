@@ -48,27 +48,35 @@ impl SeenHandle {
         }
     }
 
+    async fn register(
+        &self,
+        info: BatchInfo,
+        sequences: impl Stream<Item = Sequence>,
+        maker: impl Fn(Sequence, oneshot::Sender<Sequence>) -> Command + Copy,
+    ) -> impl Stream<Item = Sequence> {
+        let tx = self.get_agent_or_insert(info).await;
+
+        sequences
+            .zip(stream::repeat(tx))
+            .filter_map(move |(seq, tx)| async move {
+                let (resp, rx) = oneshot::channel();
+                let command = (maker)(seq, resp);
+
+                if tx.send(command).await.is_err() {
+                    error!("agent for batch {} stopped running", info.digest());
+                }
+
+                rx.await.ok()
+            })
+    }
+
     /// Register a `Stream` of sequences as seen and returns the ones that weren't already seen or delivered
     pub async fn register_seen(
         &self,
         info: BatchInfo,
         sequences: impl Stream<Item = Sequence>,
     ) -> impl Stream<Item = Sequence> {
-        let tx = self.get_agent_or_insert(info).await;
-
-        debug!("requesting seen status for {}", info.digest());
-
-        sequences
-            .zip(stream::repeat(tx))
-            .filter_map(move |(x, tx)| async move {
-                let (resp, rx) = oneshot::channel();
-
-                if tx.send(Command::Seen(x, resp)).await.is_err() {
-                    error!("agent for batch {} stopped running", info.digest());
-                };
-
-                rx.await.ok()
-            })
+        self.register(info, sequences, Command::Seen).await
     }
 
     /// Register a `Stream` of sequences as delivered and returns a stream of sequences
@@ -78,21 +86,7 @@ impl SeenHandle {
         info: BatchInfo,
         sequences: impl Stream<Item = Sequence>,
     ) -> impl Stream<Item = Sequence> {
-        let tx = self.get_agent_or_insert(info).await;
-
-        debug!("requesting delivery status for {}", info.digest());
-
-        sequences
-            .zip(stream::repeat(tx))
-            .filter_map(move |(x, tx)| async move {
-                let (resp, rx) = oneshot::channel();
-
-                if tx.send(Command::Delivered(x, resp)).await.is_err() {
-                    error!("agent for batch {} stopped running", info.digest());
-                }
-
-                rx.await.ok()
-            })
+        self.register(info, sequences, Command::Delivered).await
     }
 
     /// Register delivery for an Iterator of sequences and returns a Stream of sequences that were not already delivered
