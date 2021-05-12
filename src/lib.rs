@@ -11,6 +11,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::iter;
 use std::mem;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use drop::async_trait;
 use drop::crypto::key::exchange::PublicKey;
@@ -42,6 +43,49 @@ pub use config::{ContagionConfig, ContagionConfigBuilder};
 
 mod seen;
 pub use seen::SeenHandle;
+
+/// A `FilteredBatch` that has an expiration time
+#[derive(Clone)]
+pub struct ExpiringBatch<M>
+where
+    M: Message,
+{
+    batch: FilteredBatch<M>,
+    time: Instant,
+}
+
+impl<M> ExpiringBatch<M>
+where
+    M: Message,
+{
+    /// Check if this `ExpiringBatch` is expired
+    pub fn expired(&self, duration: Duration) -> bool {
+        Instant::now().duration_since(self.time) >= duration
+    }
+}
+
+impl<M> From<FilteredBatch<M>> for ExpiringBatch<M>
+where
+    M: Message,
+{
+    fn from(batch: FilteredBatch<M>) -> Self {
+        Self {
+            batch,
+            time: Instant::now(),
+        }
+    }
+}
+
+impl<M> std::ops::Deref for ExpiringBatch<M>
+where
+    M: Message,
+{
+    type Target = FilteredBatch<M>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.batch
+    }
+}
 
 #[derive(Debug, Snafu)]
 /// Errors encountered by the `Contagion` algorithm
@@ -125,7 +169,7 @@ where
     delivery: Option<dispatch::Sender<FilteredBatch<M>>>,
 
     seen: SeenHandle,
-    batches: RwLock<HashMap<BatchInfo, FilteredBatch<M>>>,
+    batches: RwLock<HashMap<BatchInfo, ExpiringBatch<M>>>,
 
     ready_set: RwLock<HashSet<PublicKey>>,
 
@@ -278,7 +322,7 @@ where
 
         let new_batch = batch.include(delivery.collect::<BTreeSet<_>>().await);
 
-        self.batches.write().await.insert(info, batch);
+        self.batches.write().await.insert(info, batch.into());
 
         if new_batch.is_empty() {
             None
@@ -298,6 +342,26 @@ where
             .context(Network {
                 when: "subscribing to peer",
             })
+    }
+
+    async fn purge(&self) {
+        let expiration = self.config.sieve.expiration_delay();
+        let mut batches = self.batches.write().await;
+
+        // FIXME: use `HashMap::drain_filter` once stable
+
+        let expired = batches
+            .iter()
+            .filter(|(_, b)| b.expired(expiration))
+            .map(|(k, _)| k)
+            .copied()
+            .collect::<Vec<_>>();
+
+        for info in expired {
+            batches.remove(&info);
+            self.seen.purge(&info).await;
+            self.ready_agent.purge(*info.digest()).await;
+        }
     }
 }
 
@@ -430,7 +494,7 @@ where
     }
 
     async fn garbage_collection(&self) {
-        todo!()
+        self.purge().await;
     }
 
     async fn disconnect<SA: Sampler>(&self, peer: PublicKey, sender: Arc<S>, sampler: Arc<SA>) {
@@ -657,6 +721,20 @@ pub mod test {
             .for_each(|(expected, actual)| {
                 assert_eq!(expected, actual, "bad payload delivered");
             });
+    }
+
+    #[tokio::test]
+    async fn no_delivery_conflicts() {
+        drop::test::init_logger();
+
+        const BATCH_SIZE: usize = 40;
+        const PEER_COUNT: usize = 10;
+        const CONFLICTS_CONTAGION: std::ops::Range<Sequence> = 0..CONFLICT_END as Sequence;
+        const CONFLICTS_SIEVE: std::ops::Range<Sequence> =
+            (CONFLICT_END as Sequence)..(BATCH_SIZE as Sequence);
+        const CONFLICT_END: usize = 20;
+
+        do_test(BATCH_SIZE, PEER_COUNT, CONFLICTS_SIEVE, CONFLICTS_CONTAGION).await;
     }
 
     #[tokio::test]
