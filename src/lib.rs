@@ -16,9 +16,9 @@ use std::time::{Duration, Instant};
 use drop::async_trait;
 use drop::crypto::key::exchange::PublicKey;
 use drop::crypto::sign::KeyPair;
-use drop::system::manager::Handle;
-use drop::system::sender::{ConvertSender, SenderError};
-use drop::system::{message, Message, Processor, Sampler, Sender};
+use drop::system::{
+    message, ConvertSender, Handle, Message, Processor, Sampler, Sender, SenderError,
+};
 
 use futures::future::FutureExt;
 use futures::stream::{self, Stream, StreamExt};
@@ -495,6 +495,7 @@ where
 
     async fn garbage_collection(&self) {
         self.purge().await;
+        self.sieve.garbage_collection().await;
     }
 
     async fn disconnect<SA: Sampler>(&self, peer: PublicKey, sender: Arc<S>, sampler: Arc<SA>) {
