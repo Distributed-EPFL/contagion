@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use sieve::SieveConfig;
 
+use tracing::trace;
+
 #[derive(Builder, Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "cli", derive(structopt::StructOpt))]
 /// A struct holding all necessary information required to configure a [`BatchedContagion`] instance
@@ -35,6 +37,7 @@ impl ContagionConfig {
     }
 
     fn threshold_cmp(v: i32, threshold: usize) -> bool {
+        trace!("comparing ready threshold {} <> {}", threshold, v);
         v > 0 && v as usize >= threshold
     }
 }
