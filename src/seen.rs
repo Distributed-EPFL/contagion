@@ -190,28 +190,26 @@ impl PendingAgent {
 
                 while let Some(cmd) = self.receiver.recv().await {
                     match cmd {
-                        Command::Seen(sequence, resp) => match self.set.entry(sequence) {
-                            Entry::Vacant(e) => {
+                        Command::Seen(sequence, resp) => {
+                            trace!("checking if {} is already seen", sequence);
+
+                            if let Entry::Vacant(e) = self.set.entry(sequence) {
                                 debug!("newly seen sequence {}", sequence);
                                 e.insert(State::Seen);
                                 let _ = resp.send(sequence);
                             }
-                            _ => continue,
-                        },
+                        }
                         Command::Delivered(sequence, resp) => {
-                            debug!("checking if {} is already delivered", sequence);
+                            trace!("checking if {} is already delivered", sequence);
 
-                            match self.set.entry(sequence) {
-                                Entry::Occupied(mut e) => {
-                                    if e.get_mut().set_delivered() {
-                                        debug!("newly delivered sequence {}", sequence);
+                            if let Entry::Occupied(mut e) = self.set.entry(sequence) {
+                                if e.get_mut().set_delivered() {
+                                    debug!("newly delivered sequence {}", sequence);
 
-                                        if resp.send(sequence).is_err() {
-                                            warn!("did not wait for response to delivery status");
-                                        }
+                                    if resp.send(sequence).is_err() {
+                                        warn!("did not wait for response to delivery status");
                                     }
                                 }
-                                _ => continue,
                             }
                         }
                         Command::GetSeen(channel) => {
