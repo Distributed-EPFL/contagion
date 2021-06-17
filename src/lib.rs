@@ -291,7 +291,6 @@ where
         let echoes = self
             .echoes
             .get_many_echoes_stream(digest, sequences)
-            .await
             .filter_map(|(seq, count)| {
                 future::ready(if self.config.ready_threshold_cmp(count) {
                     trace!("enough echoes for {} of {}", seq, digest);
@@ -421,23 +420,23 @@ where
             {
                 let digest = *info.digest();
 
-                if let Some((seq, echoes)) = self.echoes.send(digest, from, sequence).await {
-                    debug!("now have {} p-acks for {} of {}", echoes, seq, digest);
+                let (seq, echoes) = self.echoes.send(digest, from, sequence).await;
 
-                    if self.config.ready_threshold_cmp(echoes) {
-                        debug!(
-                            "reached threshold for payload {} of batch {}",
-                            sequence, digest
-                        );
+                debug!("now have {} p-acks for {} of {}", echoes, seq, digest);
 
-                        if let Some(batch) = self
-                            .deliverable_unseen(info, stream::once(async move { seq }))
-                            .await
-                        {
-                            debug!("ready to deliver payload {} from {}", sequence, digest);
+                if self.config.ready_threshold_cmp(echoes) {
+                    debug!(
+                        "reached threshold for payload {} of batch {}",
+                        sequence, digest
+                    );
 
-                            self.deliver(batch).await?;
-                        }
+                    if let Some(batch) = self
+                        .deliverable_unseen(info, stream::once(async move { seq }))
+                        .await
+                    {
+                        debug!("ready to deliver payload {} from {}", sequence, digest);
+
+                        self.deliver(batch).await?;
                     }
                 }
             }
@@ -474,7 +473,17 @@ where
             ContagionMessage::Subscribe if self.subscribers.write().await.insert(from) => {
                 let batches = self.batches.read().await;
                 let echoes =
-                    stream::iter(batches.keys()).map(|info| todo!("send echo for {}", info));
+                    stream::iter(batches.keys())
+                        .filter_map(|info| async move {
+                            if let Some(seqs) = self.seen.get_seen(*info.digest()).await {
+                                Some((info, seqs.collect::<Vec<_>>().await))
+                            } else {
+                                None
+                            }
+                        })
+                        .then(|(info, exclusion)| async move {
+                            ContagionMessage::Ready(*info, exclusion)
+                        });
 
                 sender
                     .send_many_to_one_stream(echoes, &from)
@@ -694,8 +703,8 @@ pub mod test {
     where
         C: ExactSizeIterator<Item = Sequence> + Clone,
     {
-        let batch = generate_batch(size);
-        let digest = batch.info().digest();
+        let batch = generate_batch(size, size);
+        let digest = *batch.info().digest();
 
         let sieve_conflicts = sieve_conflicts.collect::<Vec<_>>();
         let contagion_conflicts = contagion_conflicts.collect::<Vec<_>>();
@@ -720,19 +729,26 @@ pub mod test {
 
         let mut handle = manager.run(contagion).await;
 
+        let batch = Arc::new(batch);
+        let length = batch.len();
+
         if conflicts.len() == batch.info().size() {
             handle.deliver().await.expect_err("invalid delivery");
         } else {
-            let delivery = handle.deliver().await.expect("delivery failed");
+            let mut empty = FilteredBatch::new(batch.clone(), 0..length);
 
-            assert_eq!(delivery.info().digest(), digest, "wrong batch digest");
+            while let Ok(delivery) = handle.deliver().await {
+                empty.merge(delivery);
+            }
+
+            assert_eq!(empty.info().digest(), &digest, "wrong batch digest");
             assert_eq!(
-                delivery.excluded_len(),
+                empty.excluded_len(),
                 conflicts.len(),
                 "wrong number of conflicts"
             );
 
-            delivery
+            empty
                 .iter()
                 .map(|payload| payload.sequence())
                 .for_each(|x| {
@@ -746,7 +762,7 @@ pub mod test {
             batch
                 .iter()
                 .filter(|payload| !conflicts.contains(&payload.sequence()))
-                .zip(delivery.iter())
+                .zip(empty.iter())
                 .for_each(|(expected, actual)| {
                     assert_eq!(expected, actual, "bad payload delivered");
                 });
