@@ -42,7 +42,7 @@ pub use config::{ContagionConfig, ContagionConfigBuilder};
 
 /// A `FilteredBatch` that has an expiration time
 #[derive(Clone)]
-pub struct ExpiringBatch<M>
+struct ExpiringBatch<M>
 where
     M: Message,
 {
@@ -309,6 +309,7 @@ where
             });
 
         let new = seen.collect::<BTreeSet<_>>().await;
+        let length = new.len();
 
         if new.is_empty() {
             trace!("no new sequence deliverable for {}", digest);
@@ -322,6 +323,10 @@ where
                 .get(info)
                 .map(|batch| batch.into())
                 .map(|batch: FilteredBatch<M>| batch.include(new))
+                .map(|batch| {
+                    debug_assert_eq!(batch.len(), length, "invalid final batch length");
+                    batch
+                })
         }
     }
 
@@ -461,6 +466,8 @@ where
 
                     let delivered = delivered.included().collect::<Vec<_>>();
 
+                    println!("{:?}", delivered);
+
                     debug!("received {:?} from sieve", delivered);
 
                     if let Some(batch) = self.deliverable_seen(&info, delivered).await {
@@ -471,12 +478,22 @@ where
             }
 
             ContagionMessage::Subscribe if self.subscribers.write().await.insert(from) => {
+                info!("new subscription from {}", from);
+
                 let batches = self.batches.read().await;
                 let echoes =
                     stream::iter(batches.keys())
                         .filter_map(|info| async move {
                             if let Some(seqs) = self.seen.get_seen(*info.digest()).await {
-                                Some((info, seqs.collect::<Vec<_>>().await))
+                                let seqs = seqs.collect::<Vec<_>>().await;
+
+                                debug!(
+                                    "advertising {} sequences from {} to new subscriber",
+                                    seqs.len(),
+                                    info.digest()
+                                );
+
+                                Some((info, seqs))
                             } else {
                                 None
                             }
@@ -730,16 +747,26 @@ pub mod test {
         let mut handle = manager.run(contagion).await;
 
         let batch = Arc::new(batch);
-        let length = batch.len();
 
         if conflicts.len() == batch.info().size() {
             handle.deliver().await.expect_err("invalid delivery");
         } else {
-            let mut empty = FilteredBatch::new(batch.clone(), 0..length);
+            let mut empty = FilteredBatch::empty(batch.clone());
+
+            assert!(empty.is_empty());
 
             while let Ok(delivery) = handle.deliver().await {
+                println!("adding {} new sequences", delivery.len());
                 empty.merge(delivery);
             }
+
+            println!("final delivery: {:?}", empty);
+
+            assert_eq!(
+                empty.iter().count(),
+                batch.info().size() - conflicts.len(),
+                "iterator does not contains all payloads"
+            );
 
             assert_eq!(empty.info().digest(), &digest, "wrong batch digest");
             assert_eq!(
@@ -749,15 +776,8 @@ pub mod test {
             );
 
             empty
-                .iter()
-                .map(|payload| payload.sequence())
-                .for_each(|x| {
-                    assert!(
-                        !conflicts.contains(&x),
-                        "delivered conflicting sequence {}",
-                        x
-                    )
-                });
+                .included()
+                .for_each(|seq| assert!(!conflicts.contains(&seq)));
 
             batch
                 .iter()
@@ -777,8 +797,8 @@ pub mod test {
         const PEER_COUNT: usize = 20;
         const CONFLICTS_CONTAGION: std::ops::Range<Sequence> = 0..CONFLICT_END as Sequence;
         const CONFLICTS_SIEVE: std::ops::Range<Sequence> =
-            (CONFLICT_END as Sequence)..(BATCH_SIZE as Sequence);
-        const CONFLICT_END: usize = 20;
+            (CONFLICT_END as Sequence)..(BATCH_SIZE * BATCH_SIZE) as Sequence;
+        const CONFLICT_END: usize = 1000;
 
         do_test(BATCH_SIZE, PEER_COUNT, CONFLICTS_SIEVE, CONFLICTS_CONTAGION).await;
     }
@@ -787,8 +807,8 @@ pub mod test {
     async fn deliver_with_same_conflicts() {
         drop::test::init_logger();
 
-        const BATCH_SIZE: usize = 40;
-        const PEER_COUNT: usize = 20;
+        const BATCH_SIZE: usize = 5;
+        const PEER_COUNT: usize = 10;
         const CONFLICTS: std::ops::Range<Sequence> = 0..CONFLICT_END as Sequence;
         const CONFLICT_END: usize = 20;
 
@@ -805,5 +825,73 @@ pub mod test {
         const PEER_COUNT: usize = 20;
 
         do_test(BATCH_SIZE, PEER_COUNT, iter::empty(), iter::empty()).await;
+    }
+
+    #[tokio::test]
+    async fn single_payload_delivery() {
+        use std::iter;
+
+        drop::test::init_logger();
+
+        const PEER_COUNT: usize = 10;
+        const BLOCK_COUNT: usize = 80;
+        const BLOCK_SIZE: usize = 100;
+        const LATE_PAYLOAD: Sequence = 400;
+        const CONFLICTS: std::ops::Range<Sequence> = 0..(BLOCK_COUNT * BLOCK_SIZE) as Sequence;
+
+        let batch = generate_batch(BLOCK_COUNT, BLOCK_SIZE);
+        let initial_conflicts =
+            generate_contagion_sequence(batch.clone(), PEER_COUNT, iter::empty(), CONFLICTS);
+        let late_acks = generate_single_echo(*batch.info(), LATE_PAYLOAD, PEER_COUNT);
+        let messages = initial_conflicts.chain(late_acks);
+
+        let contagion = Contagion::default();
+
+        let mut manager = DummyManager::new(messages, PEER_COUNT);
+
+        let mut handle = manager.run(contagion).await;
+
+        let delivery: FilteredBatch<u32> = handle.deliver().await.expect("delivery failed");
+
+        debug!("batch is {:?}", delivery);
+
+        assert_eq!(delivery.len(), 1, "too many payloads delivered");
+        assert_eq!(
+            delivery.included().next().unwrap(),
+            LATE_PAYLOAD,
+            "wrong sequence delivered"
+        );
+
+        let payload = delivery.iter().next().unwrap();
+
+        assert_eq!(payload, batch.iter().nth(LATE_PAYLOAD as usize).unwrap());
+    }
+
+    #[tokio::test]
+    async fn empty_subscription() {
+        use std::iter;
+
+        const PEER_COUNT: usize = 10;
+
+        let contagion = Contagion::default();
+        let mut manager =
+            DummyManager::new(iter::once(ContagionMessage::<u32>::Subscribe), PEER_COUNT);
+
+        let mut handle = manager.run(contagion).await;
+
+        let messages = manager.sender().messages().await;
+
+        messages.iter().for_each(|msg| {
+            println!("{:?}", msg.1);
+            assert!(matches!(
+                msg.1,
+                ContagionMessage::Subscribe | ContagionMessage::Sieve(_)
+            ))
+        });
+
+        // there one subscription per peer per algorithm so 3 with murmur, sieve and contagion
+        assert_eq!(messages.len(), PEER_COUNT * 3, "too many messages sent");
+
+        handle.deliver().await.expect_err("delivered invalid batch");
     }
 }
