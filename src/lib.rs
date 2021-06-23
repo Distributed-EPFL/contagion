@@ -56,7 +56,7 @@ where
 {
     /// Check if this `ExpiringBatch` is expired
     pub fn expired(&self, duration: Duration) -> bool {
-        Instant::now().duration_since(self.time) >= duration
+        self.time.elapsed() >= duration
     }
 }
 
@@ -485,8 +485,6 @@ where
 
                     let delivered = delivered.included().collect::<Vec<_>>();
 
-                    println!("{:?}", delivered);
-
                     debug!("received {:?} from sieve", delivered);
 
                     if let Some(batch) = self.deliverable_seen(&info, delivered).await {
@@ -776,14 +774,9 @@ pub mod test {
         } else {
             let mut empty = FilteredBatch::empty(batch.clone());
 
-            assert!(empty.is_empty());
-
             while let Ok(delivery) = handle.deliver().await {
-                println!("adding {} new sequences", delivery.len());
                 empty.merge(delivery);
             }
-
-            println!("final delivery: {:?}", empty);
 
             assert_eq!(
                 empty.iter().count(),
@@ -903,7 +896,6 @@ pub mod test {
         let messages = manager.sender().messages().await;
 
         messages.iter().for_each(|msg| {
-            println!("{:?}", msg.1);
             assert!(matches!(
                 msg.1,
                 ContagionMessage::Subscribe | ContagionMessage::Sieve(_)
