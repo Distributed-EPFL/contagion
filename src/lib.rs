@@ -488,14 +488,15 @@ where
                         .await
                         .insert(*delivered.info(), delivered.into());
 
+                    self.acknowledge_batch(delivered.info(), delivered.excluded(), &sender)
+                        .await?;
+
                     let delivered = delivered.included().collect::<Vec<_>>();
 
                     debug!("received {:?} from sieve", delivered);
 
                     if let Some(batch) = self.deliverable_seen(&info, delivered).await {
                         debug!("delivering late sequence from batch {}", info.digest());
-                        self.acknowledge_batch(batch.info(), batch.excluded(), &sender)
-                            .await?;
                         self.deliver(batch).await?;
                     }
                 }
@@ -555,10 +556,9 @@ where
             .await
             .expect("sampling failed");
 
-        sender
-            .send_many(ContagionMessage::Subscribe, sample.iter())
+        self.subscribe_to(sample.iter(), &sender)
             .await
-            .expect("subscription failed");
+            .expect("failed to subscribe");
 
         self.ready_set.write().await.extend(sample);
 
