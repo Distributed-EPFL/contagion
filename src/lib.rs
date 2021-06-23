@@ -213,7 +213,7 @@ where
 
             echoes: EchoHandle::new(config.channel_cap(), "contagion"),
 
-            seen: SeenHandle::new(config.channel_cap()),
+            seen: SeenHandle::new(config.channel_cap(), "contagion"),
             batches: Default::default(),
         }
     }
@@ -435,6 +435,11 @@ where
                 let ready = self.process_exceptions(info, from, &excluding).await;
 
                 if let Some(batch) = self.deliverable_unseen(info, ready).await {
+                    debug!(
+                        "delivering sequences {} from {}",
+                        batch.included().count(),
+                        info.digest()
+                    );
                     self.deliver(batch).await?;
                 }
             }
