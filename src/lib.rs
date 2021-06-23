@@ -362,6 +362,25 @@ where
             })
     }
 
+    async fn acknowledge_batch(
+        &self,
+        info: &BatchInfo,
+        exclusions: impl Iterator<Item = Sequence>,
+        sender: &S,
+    ) -> Result<(), ContagionError> {
+        debug!("send ready message for batch {}", info.digest());
+
+        sender
+            .send_many(
+                ContagionMessage::Ready(*info, exclusions.collect()),
+                self.subscribers.read().await.iter(),
+            )
+            .await
+            .context(Network {
+                when: "acknowledging batch",
+            })
+    }
+
     async fn purge(&self) {
         let expiration = self.config.sieve.expiration_delay();
         let mut batches = self.batches.write().await;
@@ -472,6 +491,8 @@ where
 
                     if let Some(batch) = self.deliverable_seen(&info, delivered).await {
                         debug!("delivering late sequence from batch {}", info.digest());
+                        self.acknowledge_batch(batch.info(), batch.excluded(), &sender)
+                            .await?;
                         self.deliver(batch).await?;
                     }
                 }
@@ -673,6 +694,8 @@ where
 pub mod test {
     use super::*;
 
+    use std::iter;
+
     use drop::test::DummyManager;
 
     use sieve::test::{generate_batch, generate_sieve_sequence};
@@ -869,8 +892,6 @@ pub mod test {
 
     #[tokio::test]
     async fn empty_subscription() {
-        use std::iter;
-
         const PEER_COUNT: usize = 10;
 
         let contagion = Contagion::default();
@@ -893,5 +914,49 @@ pub mod test {
         assert_eq!(messages.len(), PEER_COUNT * 3, "too many messages sent");
 
         handle.deliver().await.expect_err("delivered invalid batch");
+    }
+
+    #[tokio::test]
+    async fn handle_subscription() {
+        const PEER_COUNT: usize = 10;
+        const BLOCK_SIZE: usize = 10;
+        const BLOCK_COUNT: usize = 10;
+
+        drop::test::init_logger();
+
+        let contagion = Contagion::default();
+        let batch = generate_batch(BLOCK_COUNT, BLOCK_SIZE);
+        let info = *batch.info();
+
+        let messages =
+            generate_contagion_sequence(batch, PEER_COUNT + 1, iter::empty(), iter::empty())
+                .chain(iter::repeat(ContagionMessage::Subscribe).take(PEER_COUNT));
+
+        let mut manager = DummyManager::new(messages, PEER_COUNT);
+
+        let mut handle = manager.run(contagion).await;
+
+        handle.deliver().await.expect("delivery failed");
+
+        let sent_announce = manager
+            .sender()
+            .messages()
+            .await
+            .into_iter()
+            .filter(|x| matches!(x.1, ContagionMessage::Ready(_, _)))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            sent_announce.len(),
+            PEER_COUNT,
+            "did not announce to every subscriber"
+        );
+
+        sent_announce.iter().for_each(|(_, m)| {
+            if let ContagionMessage::Ready(inf, excl) = m {
+                assert_eq!(info, *inf, "wrong batch acked");
+                assert!(excl.is_empty(), "wrong set of conflict announced");
+            }
+        })
     }
 }
