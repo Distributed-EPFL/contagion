@@ -238,7 +238,7 @@ where
         from: PublicKey,
         sequences: &'a [Sequence],
     ) -> impl Stream<Item = Sequence> + 'a {
-        let acked = (0..info.sequence()).filter(move |x| !sequences.contains(&x));
+        let acked = (0..info.sequence()).filter(move |x| !sequences.contains(x));
         let echoes = self.echoes.send_many(*info.digest(), from, acked).await;
         let digest = *info.digest();
 
@@ -573,7 +573,7 @@ where
                 .keys()
                 .await
                 .into_iter()
-                .filter(|x| !ready_set.contains(&x));
+                .filter(|x| !ready_set.contains(x));
 
             match sampler.sample(not_gossip, 1).await {
                 Ok(new) => {
